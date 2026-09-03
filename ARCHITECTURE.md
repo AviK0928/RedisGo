@@ -16,11 +16,11 @@ flowchart TB
 
     subgraph doors [Front doors]
         tcp["internal/server<br/>TCP listener :6379"]
-        http["web<br/>HTTP + WebSocket :8080"]
+        http["web<br/>HTTP and WebSocket :8080"]
     end
 
     subgraph protocol [Protocol]
-        resp["internal/resp<br/>Reader / Writer"]
+        resp["internal/resp<br/>Reader and Writer"]
     end
 
     subgraph core [Engine]
@@ -31,7 +31,7 @@ flowchart TB
     end
 
     subgraph storage [Store]
-        iface{{"Store interface<br/>View / Update"}}
+        iface{{"Store interface<br/>View and Update"}}
         sharded["ShardedStore<br/>256 shards"]
         global["GlobalStore<br/>one RWMutex"]
         syncmap["SyncMapStore"]
@@ -85,43 +85,42 @@ sequenceDiagram
     participant W as resp.Writer
 
     C->>T: bytes on the socket
-    T->>T: SetReadDeadline (idle timeout)
-    T->>R: ReadCommand()
+    T->>T: SetReadDeadline, idle timeout
+    T->>R: ReadCommand
     R->>R: parse RESP array
-    R-->>T: ["SET", "greeting", "hello"]
-
-    T->>E: Execute(args)
+    R-->>T: SET greeting hello
+    T->>E: Execute with parsed arguments
     E->>E: registry lookup
     E->>E: arity validation
 
     alt command is a write
-        E->>S: MemoryUsed()
+        E->>S: MemoryUsed
         alt usage exceeds maxmemory
-            E->>E: evictIfNeeded()
+            E->>E: evictIfNeeded
             alt policy is noeviction
-                E-->>T: -OOM command not allowed
+                E-->>T: OOM command not allowed
             end
         end
     end
 
     E->>E: increment command counter
-    E->>S: Update(key, callback)
-    Note over S: write lock held for<br/>the callback's duration
+    E->>S: Update with callback
+    Note over S: write lock held for<br/>the duration of the callback
     S-->>E: reply value
 
     alt write succeeded
-        E->>A: Append(args)
-        Note over A: logged after execution,<br/>only on success
+        E->>A: Append
+        Note over A: logged after execution<br/>and only on success
     end
 
     E-->>T: resp.Value
+    T->>W: WriteNoFlush
 
-    T->>W: WriteNoFlush(reply)
     alt further commands already buffered
-        Note over T,W: reply retained;<br/>the batch flushes together
+        Note over T,W: reply retained so that<br/>the batch flushes together
     else no pending input
-        T->>W: Flush()
-        W-->>C: +OK
+        T->>W: Flush
+        W-->>C: OK
     end
 ```
 
@@ -149,34 +148,34 @@ critical section.
 sequenceDiagram
     participant H as Handler
     participant S as ShardedStore
-    participant Sh as Shard (GlobalStore)
-    participant M as map[string]*Entry
+    participant Sh as Shard
+    participant M as Shard map
 
-    H->>S: Update("greeting", fn)
-    S->>S: fnv1a("greeting") & mask
-    S->>Sh: Update on shard 42
+    H->>S: Update with key and callback
+    S->>S: fnv1a hash masked to shard index
+    S->>Sh: Update on the selected shard
 
-    Sh->>Sh: mu.Lock()
+    Sh->>Sh: acquire write lock
     Sh->>M: retrieve current entry
-    M-->>Sh: *Entry or nil
+    M-->>Sh: entry or nil
 
     alt entry present and expired
         Sh->>M: delete
         Note over Sh: treated as absent
     end
 
-    Sh->>H: fn(current)
-    Note over H: read, modify, and decide,<br/>entirely within the lock
+    Sh->>H: invoke callback with current entry
+    Note over H: read, modify, and decide<br/>entirely within the lock
     H-->>Sh: entry to store, or nil to delete
 
     Sh->>Sh: adjust size accounting
     Sh->>M: store or delete
-    Sh->>Sh: mu.Unlock()
+    Sh->>Sh: release write lock
 ```
 
-This interface replaced an earlier design in which `Get` returned `*Entry` to
-the caller. That design released the lock before mutation, permitting lost
-updates under concurrent `INCR` on a shared key.
+This interface replaced an earlier design in which `Get` returned an entry
+pointer to the caller. That design released the lock before mutation,
+permitting lost updates under concurrent `INCR` on a shared key.
 
 ## 4. Key lifecycle
 
@@ -184,7 +183,7 @@ updates under concurrent `INCR` on a shared key.
 stateDiagram-v2
     [*] --> Live: SET, LPUSH, HSET
 
-    Live --> Live: read (records recency and frequency)
+    Live --> Live: read, recording recency and frequency
     Live --> Volatile: EXPIRE, PEXPIREAT
     Volatile --> Live: PERSIST
 
@@ -217,15 +216,15 @@ Two independent mechanisms operate concurrently.
 ```mermaid
 flowchart LR
     subgraph lazy [Lazy, on every read]
-        r1[read arrives] --> r2{deadline elapsed?}
+        r1[read arrives] --> r2{deadline elapsed}
         r2 -->|no| r3[return value]
         r2 -->|yes| r4[delete] --> r5[report as absent]
     end
 
     subgraph active [Active, every 100ms]
-        a1[tick] --> a2[sample 20 keys<br/>carrying TTLs]
+        a1[tick] --> a2["sample 20 keys<br/>carrying TTLs"]
         a2 --> a3[delete expired entries]
-        a3 --> a4{"expired fraction<br/>above 25%?"}
+        a3 --> a4{"expired fraction<br/>above 25 percent"}
         a4 -->|yes| a2
         a4 -->|no| a5[await the next tick]
     end
@@ -247,23 +246,23 @@ duration. The round limit bounds the work performed by any single tick.
 
 ```mermaid
 flowchart TD
-    w[write command received] --> chk{"memory used<br/>&gt; maxmemory?"}
+    w[write command received] --> chk{"memory used above maxmemory"}
     chk -->|no| run[execute the command]
 
     chk -->|yes| pol{policy}
-    pol -->|noeviction| oom["-OOM command not allowed"]
+    pol -->|noeviction| oom["reply OOM command not allowed"]
 
-    pol -->|allkeys-*| s1[sample 5 random keys]
-    pol -->|volatile-*| s2[sample 5 random keys<br/>carrying TTLs]
+    pol -->|allkeys| s1[sample 5 random keys]
+    pol -->|volatile| s2["sample 5 random keys<br/>carrying TTLs"]
 
     s1 --> pick
-    s2 --> empty{candidates found?}
+    s2 --> empty{candidates found}
     empty -->|no| oom
     empty -->|yes| pick
 
-    pick["select victim<br/>LRU: greatest idle time<br/>LFU: lowest decayed count<br/>TTL: nearest deadline<br/>random: first sampled"]
-    pick --> del[delete]
-    del --> again{"still above<br/>the limit?"}
+    pick["select victim<br/>LRU by greatest idle time<br/>LFU by lowest decayed count<br/>TTL by nearest deadline<br/>random by first sampled"]
+    pick --> del[delete the victim]
+    del --> again{"still above the limit"}
     again -->|yes, below 200 rounds| s1
     again -->|no| run
 ```
@@ -288,19 +287,20 @@ sequenceDiagram
     participant A as AOF
     participant L as Listeners
 
-    M->>E: New(ConfigFromEnv())
-    M->>E: EnableAOF()
+    M->>E: New with configuration from environment
+    M->>E: EnableAOF
 
-    E->>Sn: Load(redisgo.rdb)
-    Note over Sn: the older, coarser record
+    E->>Sn: Load the snapshot file
+    Note over Sn: the older and coarser record
     Sn-->>E: records, excluding those already expired
     E->>E: Restore each, bypassing dispatch
 
-    E->>A: Replay(redisgo.aof)
+    E->>A: Replay the command log
     Note over A: operations recorded<br/>after the snapshot
+
     loop each logged command
-        A->>E: Execute(args)
-        Note over E: loading flag set;<br/>replay is not re-logged
+        A->>E: Execute
+        Note over E: loading flag set, so<br/>replay is not written back
     end
 
     E->>A: Open for appending
@@ -312,15 +312,15 @@ sequenceDiagram
 ```
 
 The ordering is required for correctness. The snapshot represents the keyspace
-as of the last dump; the log records operations that followed. Reversing the
-order would allow stale snapshot values to overwrite newer logged values.
+as of the last dump, and the log records operations that followed. Reversing
+the order would allow stale snapshot values to overwrite newer logged values.
 
 Truncation is handled differently for each format:
 
 | Format | Behaviour on truncation | Justification |
 |---|---|---|
-| AOF | Replay stops at the partial record; all preceding commands are applied | Each command is independent, so partial recovery is correct recovery |
-| Snapshot | Load fails with an error | A partial snapshot is a partial database; silent acceptance would present as unexplained data loss |
+| AOF | Replay stops at the partial record and all preceding commands are applied | Each command is independent, so partial recovery is correct recovery |
+| Snapshot | Load fails with an error | A partial snapshot is a partial database, and silent acceptance would present as unexplained data loss |
 
 ## 8. AOF compaction
 
@@ -329,22 +329,22 @@ stateDiagram-v2
     [*] --> Idle
 
     Idle --> Rewriting: BGREWRITEAOF issued
-    Idle --> Rewriting: log reaches 2x its<br/>post-rewrite size
+    Idle --> Rewriting: automatic trigger on log growth
 
     state Rewriting {
         [*] --> Building
-        Building --> Building: traverse the keyspace,<br/>emit minimal commands
-        Building --> Swapping: replacement written to .rewrite
+        Building --> Building: traverse keyspace and emit minimal commands
+        Building --> Swapping: replacement file written
         Swapping --> [*]: close, rename, reopen
     }
 
     Rewriting --> Idle: new baseline recorded
-    Rewriting --> Idle: failed; original retained
+    Rewriting --> Idle: failure, original retained
 ```
 
 | Parameter | Value |
 |---|---|
-| Automatic trigger | Log size reaches 2x the post-rewrite baseline |
+| Automatic trigger | Log size reaches twice the post-rewrite baseline |
 | Minimum size before triggering | 64 KB |
 | Check interval | 30 seconds |
 
@@ -367,35 +367,35 @@ sequenceDiagram
     participant S as Session
     participant E as Engine
 
-    B->>H: GET /ws (upgrade)
-    H->>SM: create()
-    SM->>SM: generate id via crypto/rand
-    SM->>E: NewSession(id, limits)
+    B->>H: GET /ws with upgrade request
+    H->>SM: create
+    SM->>SM: generate identifier via crypto/rand
+    SM->>E: NewSession with identifier and limits
     SM-->>H: session
-    H-->>B: welcome, truncated session id
+    H-->>B: welcome and truncated identifier
 
     loop each submitted command
-        B->>H: "SET greeting hello"
-        H->>SM: touch(id)
-        H->>S: Execute(args)
+        B->>H: command text
+        H->>SM: touch the session
+        H->>S: Execute
 
         S->>S: reject server-wide commands
         S->>S: consume a rate limit token
         S->>S: validate argument sizes
         S->>S: enforce the key limit
-        S->>S: rewrite keys to sess:ID:greeting
-        S->>E: Execute(namespaced args)
+        S->>S: rewrite keys with the session prefix
+        S->>E: Execute with namespaced arguments
         E-->>S: reply
         S-->>H: reply
-        H-->>B: JSON: command, reply, key count
+        H-->>B: JSON containing command, reply, and key count
     end
 
     alt connection closed
         B--xH: socket drops
-        H->>SM: remove(id)
+        H->>SM: remove the session
         SM->>S: Close, deleting all session keys
     else idle beyond the session lifetime
-        SM->>SM: reaper removes it
+        SM->>SM: reaper removes the session
     end
 ```
 
@@ -414,32 +414,33 @@ security boundary.
 | Goroutine | Created by | Lifetime | Scope of access |
 |---|---|---|---|
 | Accept loop | `ListenTCP` | Until context cancellation | The listener |
-| Connection handler | One per TCP client | Until disconnect or 10 minute idle timeout | Its own reader and writer; the engine |
-| WebSocket reader | One per browser connection | Until close or 60 seconds without a pong | Its session; the engine |
+| Connection handler | One per TCP client | Until disconnect or 10 minute idle timeout | Its own reader and writer, and the engine |
+| WebSocket reader | One per browser connection | Until close or 60 seconds without a pong | Its session and the engine |
 | WebSocket writer | One per browser connection | Paired with its reader | The connection's write side only |
 | Expiry cycle | `main` | Until shutdown | The store, under write locks |
-| Persistence check | `main` | Until shutdown | AOF size; may initiate compaction |
+| Persistence check | `main` | Until shutdown | AOF size, and may initiate compaction |
 | Session reaper | `web.Handler` | Until shutdown | The session map and the store |
-| Background save | `BGSAVE` | Single pass | Reads the store; writes a file |
-| Background rewrite | `BGREWRITEAOF` | Single pass | Reads the store; replaces the log |
+| Background save | `BGSAVE` | Single pass | Reads the store and writes a file |
+| Background rewrite | `BGREWRITEAOF` | Single pass | Reads the store and replaces the log |
 
 ### 10.2 Synchronization
 
 | Guard | Protects |
 |---|---|
 | `GlobalStore.mu`, one per shard | That shard's map and byte counter |
-| `Engine.mu` | Command, connection, expiry and eviction counters; last save time |
+| `Engine.mu` | Command, connection, expiry and eviction counters, and last save time |
 | `Engine.rewriteMu` | AOF appends and the compaction swap |
-| `Engine.maxMemory`, `Engine.policy` | Atomic; written by `CONFIG SET`, read on every write |
-| `Entry.lastAccess`, `Entry.freq` | Atomic; written during reads, which hold only a read lock |
+| `Engine.maxMemory`, `Engine.policy` | Atomic, written by `CONFIG SET` and read on every write |
+| `Entry.lastAccess`, `Entry.freq` | Atomic, written during reads which hold only a read lock |
 | `Engine.saving`, `Engine.rewriting` | Atomic flags limiting background passes to one at a time |
 | `sessionManager.mu` | The session map |
 | `Session.mu` | That session's rate limiter state |
 
 Each WebSocket connection uses two goroutines because the underlying library
 does not support concurrent writers, while both the command loop and the ping
-ticker require write access. They communicate over a buffered channel; a send
-that would block is discarded rather than permitted to stall the command loop.
+ticker require write access. They communicate over a buffered channel, and a
+send that would block is discarded rather than permitted to stall the command
+loop.
 
 ## 11. On-disk formats
 
@@ -466,7 +467,7 @@ Record, repeated to end of file
   kind         1 byte     0 = string, 1 = list, 2 = hash
   key length   8 bytes
   key          n bytes
-  expiry       8 bytes    Unix nanoseconds; 0 indicates no expiry
+  expiry       8 bytes    Unix nanoseconds, 0 indicates no expiry
   payload                 determined by kind:
                             string  length, then bytes
                             list    element count, then length and bytes per element
