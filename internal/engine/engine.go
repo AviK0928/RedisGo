@@ -12,14 +12,22 @@ import (
 	"github.com/AviK0928/RedisGo/internal/resp"
 )
 
-const Version = "0.3.0"
+const Version = "0.4.0"
 
-// How often the active expiry loop runs, and how it samples. These match
-// Redis's defaults closely enough that the behaviour is comparable.
 const (
 	expiryInterval   = 100 * time.Millisecond
 	expirySampleSize = 20
 	expiryThreshold  = 0.25
+)
+
+// StoreKind selects a keyspace implementation. Configurable so benchmarks can
+// run the same workload against all three without touching code.
+type StoreKind string
+
+const (
+	StoreSharded StoreKind = "sharded"
+	StoreGlobal  StoreKind = "global"
+	StoreSyncMap StoreKind = "syncmap"
 )
 
 type Config struct {
@@ -27,6 +35,8 @@ type Config struct {
 	MaxKeysPerSession int
 	TCPAddr           string
 	HTTPAddr          string
+	Store             StoreKind
+	ShardCount        int
 }
 
 func DefaultConfig() Config {
@@ -35,6 +45,8 @@ func DefaultConfig() Config {
 		MaxKeysPerSession: 500,
 		TCPAddr:           ":6379",
 		HTTPAddr:          ":8080",
+		Store:             StoreSharded,
+		ShardCount:        256,
 	}
 }
 
@@ -48,6 +60,17 @@ func ConfigFromEnv() Config {
 	}
 	if v := os.Getenv("TCP_ADDR"); v != "" {
 		c.TCPAddr = v
+	}
+	switch StoreKind(strings.ToLower(os.Getenv("STORE"))) {
+	case StoreGlobal:
+		c.Store = StoreGlobal
+	case StoreSyncMap:
+		c.Store = StoreSyncMap
+	case StoreSharded:
+		c.Store = StoreSharded
+	}
+	if v, ok := envInt("SHARD_COUNT"); ok && v&(v-1) == 0 {
+		c.ShardCount = v
 	}
 	return c
 }
@@ -64,6 +87,17 @@ func envInt(key string) (int, bool) {
 	return n, true
 }
 
+func newStore(cfg Config, clock Clock) Store {
+	switch cfg.Store {
+	case StoreGlobal:
+		return NewGlobalStore(clock)
+	case StoreSyncMap:
+		return NewSyncMapStore(clock)
+	default:
+		return NewShardedStore(clock, cfg.ShardCount)
+	}
+}
+
 type Stats struct {
 	Version           string `json:"version"`
 	UptimeSeconds     int64  `json:"uptime_seconds"`
@@ -72,6 +106,7 @@ type Stats struct {
 	Connections       int    `json:"connections"`
 	ExpiredKeys       uint64 `json:"expired_keys"`
 	MaxMemoryMB       int    `json:"max_memory_mb"`
+	StoreKind         string `json:"store_kind"`
 }
 
 type Handler func(e *Engine, args []string) resp.Value
@@ -147,7 +182,7 @@ func init() {
 type Engine struct {
 	cfg       Config
 	clock     Clock
-	store     *Store
+	store     Store
 	startedAt time.Time
 
 	mu       sync.Mutex
@@ -165,13 +200,12 @@ func NewWithClock(cfg Config, clock Clock) *Engine {
 	return &Engine{
 		cfg:       cfg,
 		clock:     clock,
-		store:     NewStore(clock),
+		store:     newStore(cfg, clock),
 		startedAt: clock.Now(),
 	}
 }
 
-// StartExpiryLoop runs active expiration until the channel closes. Without it
-// the server only notices expired keys when someone reads them.
+// StartExpiryLoop runs active expiration until the channel closes.
 func (e *Engine) StartExpiryLoop(done <-chan struct{}) {
 	ticker := time.NewTicker(expiryInterval)
 	defer ticker.Stop()
@@ -181,12 +215,7 @@ func (e *Engine) StartExpiryLoop(done <-chan struct{}) {
 		case <-done:
 			return
 		case <-ticker.C:
-			removed := e.store.activeExpiryCycle(expirySampleSize, expiryThreshold)
-			if removed > 0 {
-				e.mu.Lock()
-				e.expired += uint64(removed)
-				e.mu.Unlock()
-			}
+			e.ExpireNow()
 		}
 	}
 }
@@ -194,7 +223,7 @@ func (e *Engine) StartExpiryLoop(done <-chan struct{}) {
 // ExpireNow runs one expiry cycle immediately. Tests use it to avoid waiting
 // for the ticker.
 func (e *Engine) ExpireNow() int {
-	removed := e.store.activeExpiryCycle(expirySampleSize, expiryThreshold)
+	removed := e.store.ExpireCycle(expirySampleSize, expiryThreshold)
 	if removed > 0 {
 		e.mu.Lock()
 		e.expired += uint64(removed)
@@ -218,6 +247,7 @@ func (e *Engine) Stats() Stats {
 		Connections:       conns,
 		ExpiredKeys:       expired,
 		MaxMemoryMB:       e.cfg.MaxMemoryMB,
+		StoreKind:         string(e.cfg.Store),
 	}
 }
 
@@ -261,14 +291,36 @@ func wrongType() resp.Value {
 	return resp.Err("WRONGTYPE Operation against a key holding the wrong kind of value")
 }
 
-// fetch returns a live entry of the expected kind.
-func (e *Engine) fetch(key string, want Kind) (*Entry, bool, bool) {
-	entry, found := e.store.Get(key)
+// viewTyped reads a key of an expected kind under the read lock. absent is the
+// reply for a missing key, which differs per command: nil for GET, zero for
+// STRLEN, an empty array for LRANGE.
+func (e *Engine) viewTyped(key string, want Kind, absent resp.Value, fn func(*Entry) resp.Value) resp.Value {
+	reply := absent
+	found := e.store.View(key, func(entry *Entry) {
+		if entry.Kind != want {
+			reply = wrongType()
+			return
+		}
+		reply = fn(entry)
+	})
 	if !found {
-		return nil, false, true
+		return absent
 	}
-	if entry.Kind != want {
-		return nil, false, false
-	}
-	return entry, true, true
+	return reply
+}
+
+// updateTyped runs a read-modify-write on a key of an expected kind, entirely
+// under the write lock. fn returns the entry to store, or nil to delete it.
+func (e *Engine) updateTyped(key string, want Kind, fn func(current *Entry) (*Entry, resp.Value)) resp.Value {
+	var reply resp.Value
+	e.store.Update(key, func(current *Entry) *Entry {
+		if current != nil && current.Kind != want {
+			reply = wrongType()
+			return current
+		}
+		next, r := fn(current)
+		reply = r
+		return next
+	})
+	return reply
 }
