@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -501,4 +502,170 @@ func cmdHGetAll(e *Engine, args []string) resp.Value {
 		}
 		return resp.Arr(values...)
 	})
+}
+
+// --- admin ---
+
+// cmdConfig implements CONFIG GET and CONFIG SET for the two parameters that
+// actually change behaviour at runtime.
+func cmdConfig(e *Engine, args []string) resp.Value {
+	switch strings.ToUpper(args[1]) {
+	case "GET":
+		return configGet(e, args[2])
+
+	case "SET":
+		if len(args) != 4 {
+			return resp.Err("ERR wrong number of arguments for 'config set' command")
+		}
+		return configSet(e, args[2], args[3])
+
+	default:
+		return resp.Errf("ERR unknown CONFIG subcommand '%s'", args[1])
+	}
+}
+
+func configGet(e *Engine, param string) resp.Value {
+	// CONFIG GET replies with a flat array of name, value, name, value.
+	switch strings.ToLower(param) {
+	case "maxmemory":
+		return resp.Arr(resp.BulkString("maxmemory"),
+			resp.BulkString(strconv.FormatInt(e.MaxMemory(), 10)))
+	case "maxmemory-policy":
+		return resp.Arr(resp.BulkString("maxmemory-policy"),
+			resp.BulkString(e.Policy().String()))
+	case "*":
+		return resp.Arr(
+			resp.BulkString("maxmemory"),
+			resp.BulkString(strconv.FormatInt(e.MaxMemory(), 10)),
+			resp.BulkString("maxmemory-policy"),
+			resp.BulkString(e.Policy().String()),
+		)
+	default:
+		return resp.Arr()
+	}
+}
+
+func configSet(e *Engine, param, value string) resp.Value {
+	switch strings.ToLower(param) {
+	case "maxmemory":
+		n, err := parseMemory(value)
+		if err != nil {
+			return resp.Err("ERR argument must be a memory value")
+		}
+		e.SetMaxMemory(n)
+		return resp.Simple("OK")
+
+	case "maxmemory-policy":
+		p, ok := ParsePolicy(value)
+		if !ok {
+			return resp.Err("ERR argument must be a valid maxmemory policy")
+		}
+		e.SetPolicy(p)
+		return resp.Simple("OK")
+
+	default:
+		return resp.Errf("ERR unknown parameter '%s'", param)
+	}
+}
+
+// parseMemory accepts a plain byte count or a suffixed value such as 64mb.
+func parseMemory(raw string) (int64, error) {
+	text := strings.ToLower(strings.TrimSpace(raw))
+
+	multiplier := int64(1)
+	switch {
+	case strings.HasSuffix(text, "kb"):
+		multiplier, text = 1024, strings.TrimSuffix(text, "kb")
+	case strings.HasSuffix(text, "mb"):
+		multiplier, text = 1024*1024, strings.TrimSuffix(text, "mb")
+	case strings.HasSuffix(text, "gb"):
+		multiplier, text = 1024*1024*1024, strings.TrimSuffix(text, "gb")
+	}
+
+	n, err := strconv.ParseInt(strings.TrimSpace(text), 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return n * multiplier, nil
+}
+
+// cmdInfo reports server state as the plain-text sections Redis uses.
+func cmdInfo(e *Engine, args []string) resp.Value {
+	stats := e.Stats()
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "# Server\r\nredisgo_version:%s\r\nuptime_in_seconds:%d\r\nstore:%s\r\n\r\n",
+		stats.Version, stats.UptimeSeconds, stats.StoreKind)
+
+	fmt.Fprintf(&b, "# Memory\r\nused_memory:%d\r\nmaxmemory:%d\r\nmaxmemory_policy:%s\r\n\r\n",
+		stats.MemoryUsedBytes, stats.MaxMemoryBytes, stats.Policy)
+
+	fmt.Fprintf(&b, "# Stats\r\ntotal_commands_processed:%d\r\nconnected_clients:%d\r\n"+
+		"expired_keys:%d\r\nevicted_keys:%d\r\n\r\n",
+		stats.CommandsProcessed, stats.Connections, stats.ExpiredKeys, stats.EvictedKeys)
+
+	fmt.Fprintf(&b, "# Keyspace\r\ndb0:keys=%d\r\n", stats.Keys)
+
+	return resp.BulkString(b.String())
+}
+
+// cmdMemory implements MEMORY USAGE, which reports the approximate size of one
+// key, and MEMORY DOCTOR.
+func cmdMemory(e *Engine, args []string) resp.Value {
+	switch strings.ToUpper(args[1]) {
+	case "USAGE":
+		if len(args) != 3 {
+			return resp.Err("ERR wrong number of arguments for 'memory usage' command")
+		}
+		key := args[2]
+		reply := resp.NullBulk()
+		e.store.View(key, func(entry *Entry) {
+			reply = resp.Int(entry.size(key))
+		})
+		return reply
+
+	case "DOCTOR":
+		stats := e.Stats()
+		if stats.MemoryPercent < 80 {
+			return resp.BulkString("Sam, I detect no memory issues in this instance.")
+		}
+		return resp.BulkString(fmt.Sprintf("Memory is at %.1f%% of the limit; eviction is active.",
+			stats.MemoryPercent))
+
+	default:
+		return resp.Errf("ERR unknown MEMORY subcommand '%s'", args[1])
+	}
+}
+
+// cmdObject exposes the eviction metadata, which is the only way to see the
+// LRU and LFU bookkeeping from outside.
+func cmdObject(e *Engine, args []string) resp.Value {
+	key := args[2]
+	now := e.clock.Now()
+
+	switch strings.ToUpper(args[1]) {
+	case "FREQ":
+		reply := resp.Err("ERR no such key")
+		e.store.View(key, func(entry *Entry) {
+			reply = resp.Int(int64(entry.decayedFreq(now)))
+		})
+		return reply
+
+	case "IDLETIME":
+		reply := resp.Err("ERR no such key")
+		e.store.View(key, func(entry *Entry) {
+			reply = resp.Int(int64(entry.idle(now).Seconds()))
+		})
+		return reply
+
+	case "ENCODING":
+		reply := resp.Err("ERR no such key")
+		e.store.View(key, func(entry *Entry) {
+			reply = resp.BulkString(entry.Kind.String())
+		})
+		return reply
+
+	default:
+		return resp.Errf("ERR unknown OBJECT subcommand '%s'", args[1])
+	}
 }

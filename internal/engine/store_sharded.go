@@ -1,21 +1,18 @@
 package engine
 
-// ShardedStore splits the keyspace across N independently locked maps.
-//
-// The idea: two clients touching unrelated keys almost always land on
-// different shards, so they never contend. With one global lock they always
-// contend, regardless of whether their keys have anything to do with each
-// other.
-//
-// A shard is just a GlobalStore, which is what makes the comparison honest:
-// the two implementations differ only in how many locks there are.
+import "math/rand/v2"
+
+// ShardedStore splits the keyspace across N independently locked maps, so two
+// clients touching unrelated keys almost never contend. A shard is itself a
+// GlobalStore, which is what makes the benchmark comparison honest: the two
+// implementations differ only in how many locks exist.
 type ShardedStore struct {
 	shards []*GlobalStore
 	mask   uint32
 }
 
-// NewShardedStore builds a store with shardCount shards. shardCount must be a
-// power of two, so the shard index is a bitmask rather than a modulo.
+// NewShardedStore builds a store with shardCount shards, which must be a power
+// of two so the shard index is a bitmask rather than a modulo.
 func NewShardedStore(clock Clock, shardCount int) *ShardedStore {
 	if shardCount <= 0 || shardCount&(shardCount-1) != 0 {
 		panic("engine: shard count must be a positive power of two")
@@ -25,14 +22,11 @@ func NewShardedStore(clock Clock, shardCount int) *ShardedStore {
 	for i := range shards {
 		shards[i] = NewGlobalStore(clock)
 	}
-	return &ShardedStore{
-		shards: shards,
-		mask:   uint32(shardCount - 1),
-	}
+	return &ShardedStore{shards: shards, mask: uint32(shardCount - 1)}
 }
 
-// fnv1a is a non-cryptographic hash: fast, and good enough spread for keys
-// that often share prefixes ("user:1", "user:2").
+// fnv1a is a non-cryptographic hash: fast, and it spreads keys that share
+// prefixes ("user:1", "user:2") across shards rather than clustering them.
 func fnv1a(key string) uint32 {
 	const (
 		offset32 = 2166136261
@@ -62,13 +56,20 @@ func (s *ShardedStore) Delete(key string) bool {
 	return s.shard(key).Delete(key)
 }
 
-// Len is O(shards) and takes every read lock in turn, so it is not a snapshot
-// of a single instant. That is acceptable for a stats counter and would not be
-// for anything that needs consistency.
+// Len walks every shard, so it is not a snapshot of one instant. Fine for a
+// stats counter, not fine for anything needing consistency.
 func (s *ShardedStore) Len() int {
 	total := 0
 	for _, shard := range s.shards {
 		total += shard.Len()
+	}
+	return total
+}
+
+func (s *ShardedStore) MemoryUsed() int64 {
+	var total int64
+	for _, shard := range s.shards {
+		total += shard.MemoryUsed()
 	}
 	return total
 }
@@ -87,9 +88,19 @@ func (s *ShardedStore) Flush() {
 	}
 }
 
-// ExpireCycle runs a cycle on every shard. Each shard's cycle is itself
-// bounded, so the total work per tick stays proportional to shard count rather
-// than to keyspace size. A production version would sample shards too.
+// Sample draws one candidate from each of n randomly chosen shards. Sampling
+// every shard would be O(shards) per eviction, which at 256 shards would make
+// eviction more expensive than the work it protects.
+func (s *ShardedStore) Sample(n int, volatileOnly bool) []Candidate {
+	candidates := make([]Candidate, 0, n)
+
+	for i := 0; i < n; i++ {
+		shard := s.shards[rand.IntN(len(s.shards))]
+		candidates = append(candidates, shard.Sample(1, volatileOnly)...)
+	}
+	return candidates
+}
+
 func (s *ShardedStore) ExpireCycle(sampleSize int, threshold float64) int {
 	removed := 0
 	for _, shard := range s.shards {

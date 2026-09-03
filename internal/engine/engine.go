@@ -7,21 +7,31 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/AviK0928/RedisGo/internal/resp"
 )
 
-const Version = "0.4.0"
+const Version = "0.5.0"
 
 const (
 	expiryInterval   = 100 * time.Millisecond
 	expirySampleSize = 20
 	expiryThreshold  = 0.25
+
+	// evictSampleSize is how many keys the policy looks at per eviction.
+	// Redis defaults to 5; larger samples approximate true LRU more closely
+	// at proportionally more cost per eviction.
+	evictSampleSize = 5
+
+	// evictMaxRounds bounds one eviction pass, so a single write cannot stall
+	// while the server frees an unbounded amount of memory.
+	evictMaxRounds = 200
 )
 
-// StoreKind selects a keyspace implementation. Configurable so benchmarks can
-// run the same workload against all three without touching code.
+// StoreKind selects a keyspace implementation, so benchmarks can run the same
+// workload against all three without code changes.
 type StoreKind string
 
 const (
@@ -37,6 +47,7 @@ type Config struct {
 	HTTPAddr          string
 	Store             StoreKind
 	ShardCount        int
+	Policy            Policy
 }
 
 func DefaultConfig() Config {
@@ -47,6 +58,7 @@ func DefaultConfig() Config {
 		HTTPAddr:          ":8080",
 		Store:             StoreSharded,
 		ShardCount:        256,
+		Policy:            AllKeysLRU,
 	}
 }
 
@@ -71,6 +83,9 @@ func ConfigFromEnv() Config {
 	}
 	if v, ok := envInt("SHARD_COUNT"); ok && v&(v-1) == 0 {
 		c.ShardCount = v
+	}
+	if p, ok := ParsePolicy(os.Getenv("MAXMEMORY_POLICY")); ok {
+		c.Policy = p
 	}
 	return c
 }
@@ -99,26 +114,40 @@ func newStore(cfg Config, clock Clock) Store {
 }
 
 type Stats struct {
-	Version           string `json:"version"`
-	UptimeSeconds     int64  `json:"uptime_seconds"`
-	Keys              int    `json:"keys"`
-	CommandsProcessed uint64 `json:"commands_processed"`
-	Connections       int    `json:"connections"`
-	ExpiredKeys       uint64 `json:"expired_keys"`
-	MaxMemoryMB       int    `json:"max_memory_mb"`
-	StoreKind         string `json:"store_kind"`
+	Version           string  `json:"version"`
+	UptimeSeconds     int64   `json:"uptime_seconds"`
+	Keys              int     `json:"keys"`
+	CommandsProcessed uint64  `json:"commands_processed"`
+	Connections       int     `json:"connections"`
+	ExpiredKeys       uint64  `json:"expired_keys"`
+	EvictedKeys       uint64  `json:"evicted_keys"`
+	MemoryUsedBytes   int64   `json:"memory_used_bytes"`
+	MaxMemoryBytes    int64   `json:"max_memory_bytes"`
+	MemoryPercent     float64 `json:"memory_percent"`
+	Policy            string  `json:"policy"`
+	StoreKind         string  `json:"store_kind"`
 }
 
 type Handler func(e *Engine, args []string) resp.Value
 
 // Command carries the metadata the dispatcher needs. Arity follows Redis's
 // convention: positive means exactly that many arguments including the command
-// name, negative means at least that many.
+// name, negative means at least that many. The write flag is what tells the
+// engine which commands must check memory before running.
 type Command struct {
 	Name    string
 	Arity   int
 	Flags   []string
 	Handler Handler
+}
+
+func (c Command) isWrite() bool {
+	for _, flag := range c.Flags {
+		if flag == "write" {
+			return true
+		}
+	}
+	return false
 }
 
 var registry = map[string]Command{}
@@ -177,6 +206,12 @@ func init() {
 	register(Command{Name: "HLEN", Arity: 2, Flags: []string{"readonly"}, Handler: cmdHLen})
 	register(Command{Name: "HEXISTS", Arity: 3, Flags: []string{"readonly"}, Handler: cmdHExists})
 	register(Command{Name: "HGETALL", Arity: 2, Flags: []string{"readonly"}, Handler: cmdHGetAll})
+
+	// admin
+	register(Command{Name: "CONFIG", Arity: -3, Handler: cmdConfig})
+	register(Command{Name: "INFO", Arity: -1, Handler: cmdInfo})
+	register(Command{Name: "MEMORY", Arity: -2, Handler: cmdMemory})
+	register(Command{Name: "OBJECT", Arity: 3, Handler: cmdObject})
 }
 
 type Engine struct {
@@ -185,10 +220,16 @@ type Engine struct {
 	store     Store
 	startedAt time.Time
 
+	// Reconfigurable at runtime through CONFIG SET, and read on every write,
+	// so they are atomics rather than mutex-guarded fields.
+	maxMemory atomic.Int64
+	policy    atomic.Uint32
+
 	mu       sync.Mutex
 	commands uint64
 	conns    int
 	expired  uint64
+	evicted  uint64
 }
 
 func New(cfg Config) *Engine {
@@ -197,12 +238,25 @@ func New(cfg Config) *Engine {
 
 // NewWithClock builds an engine on an injected clock, for tests.
 func NewWithClock(cfg Config, clock Clock) *Engine {
-	return &Engine{
+	e := &Engine{
 		cfg:       cfg,
 		clock:     clock,
 		store:     newStore(cfg, clock),
 		startedAt: clock.Now(),
 	}
+	e.maxMemory.Store(int64(cfg.MaxMemoryMB) * 1024 * 1024)
+	e.policy.Store(uint32(cfg.Policy))
+	return e
+}
+
+func (e *Engine) Policy() Policy     { return Policy(e.policy.Load()) }
+func (e *Engine) SetPolicy(p Policy) { e.policy.Store(uint32(p)) }
+func (e *Engine) MaxMemory() int64   { return e.maxMemory.Load() }
+func (e *Engine) SetMaxMemory(n int64) {
+	if n < 0 {
+		n = 0
+	}
+	e.maxMemory.Store(n)
 }
 
 // StartExpiryLoop runs active expiration until the channel closes.
@@ -220,8 +274,7 @@ func (e *Engine) StartExpiryLoop(done <-chan struct{}) {
 	}
 }
 
-// ExpireNow runs one expiry cycle immediately. Tests use it to avoid waiting
-// for the ticker.
+// ExpireNow runs one expiry cycle immediately, so tests need not wait.
 func (e *Engine) ExpireNow() int {
 	removed := e.store.ExpireCycle(expirySampleSize, expiryThreshold)
 	if removed > 0 {
@@ -232,12 +285,59 @@ func (e *Engine) ExpireNow() int {
 	return removed
 }
 
+// evictIfNeeded frees memory until usage is back under the limit. It reports
+// whether the write may proceed; false means the policy is noeviction and the
+// server is full.
+func (e *Engine) evictIfNeeded() bool {
+	limit := e.maxMemory.Load()
+	if limit <= 0 || e.store.MemoryUsed() <= limit {
+		return true
+	}
+
+	policy := e.Policy()
+	if policy == NoEviction {
+		return false
+	}
+
+	freed := 0
+	for round := 0; round < evictMaxRounds && e.store.MemoryUsed() > limit; round++ {
+		candidates := e.store.Sample(evictSampleSize, policy.volatileOnly())
+
+		victim, ok := pickVictim(candidates, policy)
+		if !ok {
+			// Nothing eligible. Under a volatile policy this means no key has
+			// a TTL, and Redis treats that as out of memory rather than
+			// evicting data that was never marked as disposable.
+			break
+		}
+		if e.store.Delete(victim) {
+			freed++
+		}
+	}
+
+	if freed > 0 {
+		e.mu.Lock()
+		e.evicted += uint64(freed)
+		e.mu.Unlock()
+	}
+
+	return e.store.MemoryUsed() <= limit
+}
+
 func (e *Engine) Config() Config { return e.cfg }
 
 func (e *Engine) Stats() Stats {
 	e.mu.Lock()
-	commands, conns, expired := e.commands, e.conns, e.expired
+	commands, conns, expired, evicted := e.commands, e.conns, e.expired, e.evicted
 	e.mu.Unlock()
+
+	used := e.store.MemoryUsed()
+	limit := e.maxMemory.Load()
+
+	percent := 0.0
+	if limit > 0 {
+		percent = float64(used) / float64(limit) * 100
+	}
 
 	return Stats{
 		Version:           Version,
@@ -246,7 +346,11 @@ func (e *Engine) Stats() Stats {
 		CommandsProcessed: commands,
 		Connections:       conns,
 		ExpiredKeys:       expired,
-		MaxMemoryMB:       e.cfg.MaxMemoryMB,
+		EvictedKeys:       evicted,
+		MemoryUsedBytes:   used,
+		MaxMemoryBytes:    limit,
+		MemoryPercent:     percent,
+		Policy:            e.Policy().String(),
 		StoreKind:         string(e.cfg.Store),
 	}
 }
@@ -271,6 +375,14 @@ func (e *Engine) Execute(args []string) resp.Value {
 		return resp.Errf("ERR wrong number of arguments for '%s' command", name)
 	}
 
+	// Memory is checked before each write. Eviction brings usage below the
+	// limit and the write then lands on top, so maxmemory is a target the
+	// server converges on rather than a hard ceiling: usage can exceed it by
+	// roughly the size of one value.
+	if cmd.isWrite() && !e.evictIfNeeded() {
+		return resp.Err("OOM command not allowed when used memory > 'maxmemory'")
+	}
+
 	e.mu.Lock()
 	e.commands++
 	e.mu.Unlock()
@@ -286,7 +398,7 @@ func arityOK(arity, got int) bool {
 }
 
 // wrongType is the error real Redis returns when a command meets a key of the
-// wrong kind. Clients check for this prefix, so the wording matters.
+// wrong kind. Clients match on this prefix, so the wording matters.
 func wrongType() resp.Value {
 	return resp.Err("WRONGTYPE Operation against a key holding the wrong kind of value")
 }

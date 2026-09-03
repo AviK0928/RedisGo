@@ -85,6 +85,9 @@ func format(v resp.Value) string {
 		if v.IsNull {
 			return "(nil)"
 		}
+		if strings.Contains(v.Str, "\n") {
+			return v.Str
+		}
 		return strconv.Quote(v.Str)
 	case resp.Array:
 		if v.IsNull {

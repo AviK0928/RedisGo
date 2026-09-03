@@ -1,18 +1,20 @@
 package engine
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // SyncMapStore uses sync.Map for storage.
 //
-// Worth measuring because sync.Map is often reached for reflexively, but it
-// is built for a specific shape: keys written once and read many times. It
-// also cannot express an atomic read-modify-write, which a cache needs for
-// INCR and for SET NX. So writes still take a mutex here, and the only thing
-// sync.Map buys is lock-free reads. Expect it to win on read-heavy mixes and
-// lose on write-heavy ones.
+// Worth measuring because sync.Map is often reached for reflexively, but it is
+// built for one shape: keys written once and read many times. It also cannot
+// express an atomic read-modify-write, which a cache needs for INCR and SET NX,
+// so writes still take a mutex here. The only thing it buys is lock-free reads.
 type SyncMapStore struct {
 	data    sync.Map // string -> *Entry
 	writeMu sync.Mutex
+	bytes   atomic.Int64
 	clock   Clock
 }
 
@@ -26,12 +28,15 @@ func (s *SyncMapStore) View(key string, fn func(*Entry)) bool {
 		return false
 	}
 
+	now := s.clock.Now()
 	entry := value.(*Entry)
-	if entry.expired(s.clock.Now()) {
+
+	if entry.expired(now) {
 		s.Delete(key)
 		return false
 	}
 
+	entry.touch(now)
 	fn(entry)
 	return true
 }
@@ -40,10 +45,13 @@ func (s *SyncMapStore) Update(key string, fn func(*Entry) *Entry) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
+	now := s.clock.Now()
 	var current *Entry
+
 	if value, found := s.data.Load(key); found {
 		entry := value.(*Entry)
-		if entry.expired(s.clock.Now()) {
+		s.bytes.Add(-entry.size(key))
+		if entry.expired(now) {
 			s.data.Delete(key)
 		} else {
 			current = entry
@@ -55,22 +63,27 @@ func (s *SyncMapStore) Update(key string, fn func(*Entry) *Entry) {
 		s.data.Delete(key)
 		return
 	}
+
+	next.touch(now)
 	s.data.Store(key, next)
+	s.bytes.Add(next.size(key))
 }
 
 func (s *SyncMapStore) Delete(key string) bool {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	if _, found := s.data.Load(key); !found {
+	value, found := s.data.Load(key)
+	if !found {
 		return false
 	}
+	s.bytes.Add(-value.(*Entry).size(key))
 	s.data.Delete(key)
 	return true
 }
 
-// Len has no shortcut here: sync.Map keeps no count, so this walks everything.
-// That is a real cost the map-plus-mutex implementations do not pay.
+// Len has no shortcut: sync.Map keeps no count, so this walks everything. That
+// is a real cost the map-plus-mutex implementations do not pay.
 func (s *SyncMapStore) Len() int {
 	count := 0
 	s.data.Range(func(_, _ any) bool {
@@ -78,6 +91,13 @@ func (s *SyncMapStore) Len() int {
 		return true
 	})
 	return count
+}
+
+func (s *SyncMapStore) MemoryUsed() int64 {
+	if n := s.bytes.Load(); n > 0 {
+		return n
+	}
+	return 0
 }
 
 func (s *SyncMapStore) Keys() []string {
@@ -101,6 +121,28 @@ func (s *SyncMapStore) Flush() {
 		s.data.Delete(key)
 		return true
 	})
+	s.bytes.Store(0)
+}
+
+func (s *SyncMapStore) Sample(n int, volatileOnly bool) []Candidate {
+	now := s.clock.Now()
+
+	candidates := make([]Candidate, 0, n)
+	s.data.Range(func(key, value any) bool {
+		entry := value.(*Entry)
+		if volatileOnly && entry.ExpireAt.IsZero() {
+			return true
+		}
+		candidates = append(candidates, Candidate{
+			Key:      key.(string),
+			Idle:     entry.idle(now),
+			Freq:     entry.decayedFreq(now),
+			ExpireAt: entry.ExpireAt,
+			Size:     entry.size(key.(string)),
+		})
+		return len(candidates) < n
+	})
+	return candidates
 }
 
 func (s *SyncMapStore) ExpireCycle(sampleSize int, threshold float64) int {
@@ -126,7 +168,10 @@ func (s *SyncMapStore) ExpireCycle(sampleSize int, threshold float64) int {
 		})
 
 		for _, key := range expired {
-			s.data.Delete(key)
+			if value, found := s.data.Load(key); found {
+				s.bytes.Add(-value.(*Entry).size(key))
+				s.data.Delete(key)
+			}
 		}
 		s.writeMu.Unlock()
 
