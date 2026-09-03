@@ -5,6 +5,7 @@ on:
     branches:
       - "**"
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
@@ -41,9 +42,10 @@ jobs:
 
   bench:
     runs-on: ubuntu-latest
-    # Only on main. Benchmarks take several minutes, and running them on every
-    # branch push would slow the feedback loop for no benefit.
-    if: github.ref == 'workflow_dispatch'
+    # Manual only. A full sweep takes around 20 minutes, and the numbers are
+    # needed a handful of times across the project rather than every push.
+    # Run it from the Actions tab: select this workflow, then Run workflow.
+    if: github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
 
