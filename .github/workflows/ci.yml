@@ -38,3 +38,39 @@ jobs:
           echo
           curl -fsS http://localhost:8080/api/stats
           kill $SERVER_PID
+
+  bench:
+    runs-on: ubuntu-latest
+    # Only on main. Benchmarks take several minutes, and running them on every
+    # branch push would slow the feedback loop for no benefit.
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      - name: Report the runner hardware
+        run: |
+          nproc
+          lscpu | grep -E "Model name|CPU\(s\)|MHz" || true
+
+      - name: Run benchmarks
+        run: |
+          go test -bench=. -benchmem -benchtime=3s -count=5 -cpu=4 \
+            ./internal/engine/ | tee bench.txt
+
+      - name: Summarize with benchstat
+        run: |
+          go install golang.org/x/perf/cmd/benchstat@latest
+          "$(go env GOPATH)/bin/benchstat" bench.txt | tee benchstat.txt
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks
+          path: |
+            bench.txt
+            benchstat.txt
