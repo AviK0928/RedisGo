@@ -5,66 +5,310 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>redisgo</title>
 <style>
+  :root {
+    --paper: #e9edeb;
+    --panel: #f4f6f5;
+    --ink: #131b18;
+    --muted: #5d6b65;
+    --rule: #c3cdc8;
+    --live: #1f7a4d;
+    --warn: #9a6410;
+    --slot: #d5dcd9;
+  }
+
+  * { box-sizing: border-box; }
+
   body {
-    margin: 0; padding: 3rem 1.5rem;
-    background: #e9edeb; color: #131b18;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    margin: 0;
+    padding: 2rem 1.5rem 3rem;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 14px;
     line-height: 1.6;
   }
-  main { max-width: 60ch; margin: 0 auto; }
-  h1 { font-size: 2rem; margin: 0 0 .25rem; }
-  p.sub { color: #5d6b65; margin: 0 0 2rem; }
-  #status { padding-bottom: .75rem; border-bottom: 1px solid #c3cdc8; }
-  dl { display: grid; grid-template-columns: max-content 1fr; gap: .35rem 1.5rem; margin: 1.5rem 0; }
-  dt { color: #5d6b65; }
-  dd { margin: 0; font-variant-numeric: tabular-nums; }
-  footer { color: #5d6b65; font-size: .85rem; border-top: 1px solid #c3cdc8; padding-top: 1rem; }
+
+  main { max-width: 1100px; margin: 0 auto; }
+
+  header { margin-bottom: 1.5rem; }
+  h1 { font-size: 1.75rem; font-weight: 600; margin: 0 0 .25rem; letter-spacing: -.02em; }
+  .tagline { color: var(--muted); margin: 0; max-width: 70ch; }
+
+  .layout { display: grid; grid-template-columns: 1fr 300px; gap: 1.5rem; align-items: start; }
+  @media (max-width: 860px) { .layout { grid-template-columns: 1fr; } }
+
+  #terminal {
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    height: 460px;
+    overflow-y: auto;
+    padding: 1rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  #terminal .cmd { color: var(--ink); }
+  #terminal .cmd::before { content: "> "; color: var(--muted); }
+  #terminal .reply { color: var(--live); }
+  #terminal .err { color: var(--warn); }
+  #terminal .note { color: var(--muted); }
+
+  .prompt { display: flex; align-items: center; gap: .5rem; margin-top: .75rem; }
+  .prompt span { color: var(--muted); }
+  .prompt input {
+    flex: 1;
+    font: inherit;
+    color: inherit;
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    padding: .5rem .75rem;
+  }
+  .prompt input:focus { outline: 2px solid var(--live); outline-offset: -1px; }
+
+  aside {
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    padding: 1rem;
+    background: var(--panel);
+  }
+  aside h2 { font-size: .95rem; font-weight: 600; margin: 0 0 .75rem; }
+  aside h2 + h2 { margin-top: 1.25rem; }
+
+  dl { display: grid; grid-template-columns: 1fr auto; gap: .3rem .75rem; margin: 0 0 1.25rem; }
+  dt { color: var(--muted); }
+  dd { margin: 0; font-variant-numeric: tabular-nums; text-align: right; }
+
+  .bar { height: 6px; background: var(--slot); border-radius: 3px; overflow: hidden; margin-bottom: .35rem; }
+  .bar div { height: 100%; background: var(--live); width: 0; transition: width .4s ease; }
+  .bar-label { color: var(--muted); font-size: .85rem; margin: 0 0 1.25rem; }
+
+  .examples { display: flex; flex-wrap: wrap; gap: .35rem; }
+  .examples button {
+    font: inherit;
+    font-size: .85rem;
+    color: var(--ink);
+    background: var(--paper);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    padding: .25rem .5rem;
+    cursor: pointer;
+  }
+  .examples button:hover { border-color: var(--live); }
+  .examples button:focus-visible { outline: 2px solid var(--live); outline-offset: 1px; }
+
+  footer {
+    margin-top: 2rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--rule);
+    color: var(--muted);
+    font-size: .85rem;
+    max-width: 70ch;
+  }
+  a { color: var(--ink); text-underline-offset: 3px; }
 </style>
 </head>
 <body>
 <main>
-  <h1>redisgo</h1>
-  <p class="sub">An in-memory cache server that speaks Redis, written in Go.</p>
+  <header>
+    <h1>redisgo</h1>
+    <p class="tagline">An in-memory cache server that speaks the Redis protocol, written in Go. This terminal is connected to a live instance.</p>
+  </header>
 
-  <div id="status">connecting to the server</div>
+  <div class="layout">
+    <section>
+      <div id="terminal"></div>
+      <div class="prompt">
+        <span id="promptLabel">connecting</span>
+        <input id="input" autocomplete="off" autocapitalize="off" spellcheck="false"
+               placeholder="SET greeting hello" disabled>
+      </div>
+    </section>
 
-  <dl>
-    <dt>version</dt><dd id="version">&mdash;</dd>
-    <dt>uptime</dt><dd id="uptime">&mdash;</dd>
-    <dt>commands</dt><dd id="commands">&mdash;</dd>
-    <dt>connections</dt><dd id="connections">&mdash;</dd>
-    <dt>memory cap</dt><dd id="maxmem">&mdash;</dd>
-  </dl>
+    <aside>
+      <h2>Your keyspace</h2>
+      <div class="bar"><div id="keyBar"></div></div>
+      <p class="bar-label"><span id="sessionKeys">0</span> of <span id="sessionMax">500</span> keys</p>
 
-  <footer>Phase 0 of 9. The terminal lands in a later phase.</footer>
+      <h2>Server</h2>
+      <div class="bar"><div id="memBar"></div></div>
+      <p class="bar-label"><span id="memUsed">0 B</span> of <span id="memMax">0 B</span></p>
+
+      <dl>
+        <dt>keys held</dt><dd id="keys">&mdash;</dd>
+        <dt>commands</dt><dd id="commands">&mdash;</dd>
+        <dt>evicted</dt><dd id="evicted">&mdash;</dd>
+        <dt>expired</dt><dd id="expired">&mdash;</dd>
+        <dt>policy</dt><dd id="policy">&mdash;</dd>
+        <dt>store</dt><dd id="store">&mdash;</dd>
+        <dt>sessions</dt><dd id="sessions">&mdash;</dd>
+        <dt>uptime</dt><dd id="uptime">&mdash;</dd>
+      </dl>
+
+      <h2>Try these</h2>
+      <div class="examples" id="examples"></div>
+    </aside>
+  </div>
+
+  <footer>
+    <p>Keys are namespaced per visitor, so this session is yours alone and is
+    cleared when you leave. The server runs on a free instance that sleeps
+    after 15 minutes without traffic, so the first request after an idle
+    period takes about a minute.</p>
+    <p><a href="https://github.com/AviK0928/RedisGo">Source on GitHub</a></p>
+  </footer>
 </main>
 
 <script>
-  const el = (id) => document.getElementById(id);
+const term = document.getElementById("terminal");
+const input = document.getElementById("input");
+const promptLabel = document.getElementById("promptLabel");
+const el = (id) => document.getElementById(id);
 
-  function uptime(s) {
-    const m = Math.floor(s / 60), sec = s % 60;
-    return m > 0 ? m + "m " + String(sec).padStart(2, "0") + "s" : sec + "s";
-  }
+const history = [];
+let historyIndex = 0;
+let socket = null;
 
-  async function poll() {
-    try {
-      const res = await fetch("/api/stats", { cache: "no-store" });
-      if (!res.ok) throw new Error(res.status);
-      const s = await res.json();
-      el("status").textContent = "server awake, accepting commands";
-      el("version").textContent = s.version;
-      el("uptime").textContent = uptime(s.uptime_seconds);
-      el("commands").textContent = s.commands_processed;
-      el("connections").textContent = s.connections;
-      el("maxmem").textContent = s.max_memory_mb + " MB";
-    } catch {
-      el("status").textContent = "no answer from the server, retrying";
+function print(text, cls) {
+  const line = document.createElement("div");
+  line.className = cls;
+  line.textContent = text;
+  term.appendChild(line);
+  term.scrollTop = term.scrollHeight;
+}
+
+// The session's own key count arrives with every reply, since it is per
+// connection and the stats endpoint is server-wide.
+function updateSession(msg) {
+  if (typeof msg.max_keys !== "number" || msg.max_keys === 0) return;
+  el("sessionKeys").textContent = msg.keys;
+  el("sessionMax").textContent = msg.max_keys;
+  el("keyBar").style.width = Math.min((msg.keys / msg.max_keys) * 100, 100) + "%";
+}
+
+function connect() {
+  const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+  socket = new WebSocket(`${scheme}//${location.host}/ws`);
+
+  socket.onopen = () => {
+    input.disabled = false;
+    input.focus();
+  };
+
+  socket.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    updateSession(msg);
+
+    if (msg.type === "welcome") {
+      promptLabel.textContent = msg.session;
+      print(msg.text, "note");
+      return;
     }
+
+    print(msg.command, "cmd");
+    print(msg.text, msg.type === "error" ? "err" : "reply");
+  };
+
+  socket.onclose = () => {
+    input.disabled = true;
+    promptLabel.textContent = "closed";
+    print("Disconnected. Reconnecting in a moment.", "note");
+    setTimeout(connect, 3000);
+  };
+}
+
+input.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    const line = input.value.trim();
+    if (!line) return;
+    history.push(line);
+    historyIndex = history.length;
+    socket.send(line);
+    input.value = "";
+    return;
   }
 
-  poll();
-  setInterval(poll, 2000);
+  if (event.key === "ArrowUp" && historyIndex > 0) {
+    event.preventDefault();
+    input.value = history[--historyIndex];
+  }
+
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    historyIndex = Math.min(historyIndex + 1, history.length);
+    input.value = history[historyIndex] ?? "";
+  }
+});
+
+// Ordered so that clicking straight down the list tells a story: set and read
+// a key, watch one expire, then the collection types, then the server's view.
+const examples = [
+  "SET greeting hello",
+  "GET greeting",
+  "SET token abc123 EX 10",
+  "TTL token",
+  "INCR visits",
+  "RPUSH queue alpha beta gamma",
+  "LRANGE queue 0 -1",
+  "HSET config theme dark",
+  "HGETALL config",
+  "KEYS *",
+  "INFO",
+  "FLUSHALL",
+];
+
+const box = el("examples");
+for (const cmd of examples) {
+  const button = document.createElement("button");
+  button.textContent = cmd;
+  button.onclick = () => {
+    input.value = cmd;
+    input.focus();
+  };
+  box.appendChild(button);
+}
+
+function bytes(n) {
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / 1024 / 1024).toFixed(1) + " MB";
+}
+
+function duration(s) {
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s % 60}s`;
+  return `${s}s`;
+}
+
+async function poll() {
+  try {
+    const res = await fetch("/api/stats", { cache: "no-store" });
+    const s = await res.json();
+
+    el("keys").textContent = s.keys.toLocaleString();
+    el("commands").textContent = s.commands_processed.toLocaleString();
+    el("evicted").textContent = s.evicted_keys.toLocaleString();
+    el("expired").textContent = s.expired_keys.toLocaleString();
+    el("policy").textContent = s.policy;
+    el("store").textContent = s.store_kind;
+    el("sessions").textContent = s.active_sessions;
+    el("uptime").textContent = duration(s.uptime_seconds);
+
+    el("memUsed").textContent = bytes(s.memory_used_bytes);
+    el("memMax").textContent = bytes(s.max_memory_bytes);
+    el("memBar").style.width = Math.min(s.memory_percent, 100) + "%";
+  } catch {
+    // The dashboard is supplementary; a failed poll must not disturb the
+    // terminal, which has its own connection.
+  }
+}
+
+connect();
+poll();
+setInterval(poll, 2000);
 </script>
 </body>
 </html>

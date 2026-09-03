@@ -63,7 +63,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              httpAddr,
-		Handler:           web.Handler(eng),
+		Handler:           web.Handler(eng, background),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
