@@ -1,98 +1,137 @@
 # redisgo
-
-An in-memory cache server that speaks the Redis wire protocol, written in Go
-with the standard library.
-
+ 
+An in-memory cache server that speaks the Redis wire protocol, written in Go.
+Real Redis clients connect to it without knowing the difference.
+ 
 ![ci](https://github.com/AviK0928/RedisGo/actions/workflows/ci.yml/badge.svg)
-
-**Live demo:** _coming with the first deploy_
-
-> Status: phase 0 of 9. The build, test, and deploy pipeline works end to end.
-> The cache itself is being built on top of it, one subsystem at a time.
-> Progress is tracked below.
-
-## Why
-
-Writing a cache from the socket upward is the most direct way to work through
-protocol design, concurrent data structures, key expiry, eviction under memory
-pressure, and durability, all in one system. The target is a server that real
-Redis clients can talk to without knowing the difference.
-
-No third-party dependencies so far. Everything is the Go standard library.
-
+ 
+**[Live demo](https://redisgo-r2za.onrender.com/)** — a browser terminal wired to
+a running instance. Every visitor gets an isolated keyspace.
+ 
+> The demo runs on a free instance that sleeps after 15 minutes without
+> traffic, so the first request after an idle period takes about a minute.
+ 
+## What it does
+ 
+- **RESP2 protocol**, so `redis-cli` and the standard `go-redis` client work unmodified
+- **Strings, lists and hashes**, with `WRONGTYPE` errors on mismatched operations
+- **Key expiry** through both mechanisms Redis uses: lazily on read, and an
+  active sampling cycle for keys nobody reads again
+- **A sharded concurrent store**, benchmarked against a single-mutex baseline
+  and against `sync.Map`
+- **Memory limits and eviction**: `noeviction`, approximated LRU, LFU with a
+  decaying logarithmic counter, and the volatile variants
+- **Persistence**: an append-only log with three fsync policies, log compaction,
+  and binary snapshots
+- **Pipelining** on both sides, so a batch costs one syscall rather than one per command
+- **A browser playground** with per-visitor key namespacing, rate limits and live metrics
+## Numbers
+ 
+Measured on GitHub Actions runners (Xeon Platinum 8573C, 4 cores). Full tables
+and methodology in [BENCHMARKS.md](BENCHMARKS.md).
+ 
+| | Result |
+|---|---|
+| Sharded vs. single-mutex store, 512 goroutines | **2.9x** faster |
+| Sharded store, 1 → 512 goroutines | 284ns → 272ns (flat) |
+| Single-mutex store, same range | 616ns → 779ns (degrades) |
+| Pipelined 100 commands vs. sequential | **12.5x** faster |
+| Protocol decoder under fuzzing | 3.8M malformed inputs, no crashes |
+| 2.8 MB written into a 1 MB limit | held at 1.05 MB, 3163 keys evicted |
+ 
 ## Running it
-
+ 
 Requires Go 1.22 or later.
-
+ 
 ```
 go run ./cmd/server
 ```
-
-Two listeners start:
-
+ 
 | Address | What |
 |---|---|
 | `:6379` | the cache, over TCP |
-| `:8080` | a stats page in the browser |
-
-Drive it with the bundled client, in a second terminal:
-
+| `:8080` | the browser playground and metrics |
+ 
+Connect with the real client:
+ 
+```
+redis-cli -p 6379
+127.0.0.1:6379> SET greeting hello
+OK
+127.0.0.1:6379> GET greeting
+"hello"
+```
+ 
+Or with the bundled one, which needs nothing installed:
+ 
 ```
 go run ./cmd/cli
-127.0.0.1:6379> PING
-PONG
-127.0.0.1:6379> ECHO hello
-hello
 ```
-
-Once phase 1 lands, `redis-cli -p 6379` connects here too.
-
+ 
+### Configuration
+ 
+Everything is set through the environment.
+ 
+| Variable | Default | What it does |
+|---|---|---|
+| `MAX_MEMORY_MB` | `32` | eviction threshold |
+| `MAXMEMORY_POLICY` | `allkeys-lru` | `noeviction`, `allkeys-lru`, `allkeys-lfu`, `allkeys-random`, `volatile-lru`, `volatile-ttl`, `volatile-random` |
+| `STORE` | `sharded` | `sharded`, `global`, `syncmap` |
+| `SHARD_COUNT` | `256` | must be a power of two |
+| `AOF_ENABLED` | `false` | write every command to a log |
+| `AOF_SYNC` | `everysec` | `always`, `everysec`, `no` |
+| `PORT` | unset | when set, the server starts in cloud mode: HTTP only |
+ 
+Try eviction for yourself:
+ 
+```
+MAX_MEMORY_MB=1 go run ./cmd/server
+```
+ 
+Then write a few megabytes into it and watch `INFO` hold the line.
+ 
 ## Tests
-
+ 
 ```
-go test ./...          # fast
-go test -race ./...    # what CI runs
-go vet ./...
-gofmt -l .             # should print nothing
+go test ./...              # fast
+go test -race ./...        # what CI runs
+go test -bench=. ./...     # benchmarks
+go test -fuzz=FuzzRead ./internal/resp/
 ```
-
+ 
 ## Architecture
-
+ 
 ```
 cmd/server       the binary, and the local/cloud mode switch
-cmd/cli          a small client, so redis-tools is not needed to develop
-internal/engine  the cache core: config, counters, command execution
+cmd/cli          a Redis client, so redis-tools is not needed to develop
+internal/resp    the wire protocol: reader, writer, fuzz-tested decoder
+internal/engine  the cache core: store implementations, commands, eviction
+internal/aof     the append-only log and its replay
+internal/snapshot  the binary point-in-time dump format
 internal/server  the TCP front door
-web              the HTTP front door and the embedded stats page
+web              the HTTP front door and the embedded playground
 ```
-
-The engine knows nothing about transports. The TCP listener and the HTTP
-handler both call the same `Execute`, which is what will let a browser terminal
-and a real Redis client exercise identical code.
-
-## Progress
-
-- [x] Scaffold, CI, and continuous deployment
-- [ ] RESP protocol, so redis-cli can connect
-- [ ] Data structures and key expiry
-- [ ] Sharded concurrent store, benchmarked against a single-mutex baseline
-- [ ] Memory limits and eviction (LRU, LFU, TTL)
-- [ ] Append-only file and snapshots
-- [ ] Pub/sub, transactions, pipelining
-- [ ] Leader-follower replication
-- [ ] Terminal in the browser
-
+ 
+The engine knows nothing about transports. The TCP listener and the WebSocket
+bridge both call the same dispatcher, which is why a browser terminal and
+`redis-cli` exercise identical code.
+ 
+Design decisions and their reasoning are in [DESIGN.md](DESIGN.md), including
+where this deliberately differs from real Redis and what it does not attempt.
+ 
+## Dependencies
+ 
+The cache engine, protocol, storage, eviction and persistence are standard
+library only. Two dependencies sit at the edges: `gorilla/websocket` for the
+browser handshake, and `go-redis` in tests, where it proves wire compatibility
+by driving the server as an ordinary Redis client would.
+ 
 ## Deployment
-
-One binary, deployed to a Render free web service using Render's native Go
-runtime. No Dockerfile and no separate frontend build: the static files are
-compiled into the binary with `go:embed`.
-
-When `PORT` is set the server assumes it is in the cloud and starts only the
-HTTP listener, because a free web service exposes exactly one port. The free
-instance sleeps after 15 minutes without traffic, so the first request after an
-idle period takes about a minute to answer.
-
+ 
+One binary. The static files are compiled in with `go:embed`, so there is no
+separate frontend build and no Dockerfile. When `PORT` is set the server starts
+the HTTP listener only, because a free web service exposes exactly one port.
+ 
 ## License
-
+ 
 MIT
