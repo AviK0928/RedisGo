@@ -67,6 +67,10 @@ Or with the bundled one, which needs nothing installed:
 ```
 go run ./cmd/cli
 ```
+
+[Detailed Setup Instructions](SETUP.md) to follow and setup
+locally or remotely
+
  
 ### Configuration
  
@@ -89,6 +93,9 @@ MAX_MEMORY_MB=1 go run ./cmd/server
 ```
  
 Then write a few megabytes into it and watch `INFO` hold the line.
+
+[Additional Configuration Details](CONFIGURATION.md)
+
  
 ## Tests
  
@@ -118,6 +125,9 @@ bridge both call the same dispatcher, which is why a browser terminal and
  
 Design decisions and their reasoning are in [DESIGN.md](DESIGN.md), including
 where this deliberately differs from real Redis and what it does not attempt.
+
+[Architecture](ARCHITECTURE.md) shows a detailed view into the structure and flow
+of the project.
  
 ## Dependencies
  
@@ -136,6 +146,10 @@ by driving the server as an ordinary Redis client would.
 One binary. The static files are compiled in with `go:embed`, so there is no
 separate frontend build and no Dockerfile. When `PORT` is set the server starts
 the HTTP listener only, because a free web service exposes exactly one port.
+
+## Available Commands
+
+[Commands](COMMANDS.md)
  
 ## License
  
