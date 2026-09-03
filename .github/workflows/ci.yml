@@ -43,7 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     # Only on main. Benchmarks take several minutes, and running them on every
     # branch push would slow the feedback loop for no benefit.
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
 
@@ -59,7 +59,7 @@ jobs:
 
       - name: Run benchmarks
         run: |
-          go test -bench=. -benchmem -benchtime=3s -count=5 -cpu=4 \
+          go test -bench=. -benchmem -benchtime=3s -count=10 -cpu=4 \
             ./internal/engine/ | tee bench.txt
 
       - name: Summarize with benchstat
