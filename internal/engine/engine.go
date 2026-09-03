@@ -3,18 +3,17 @@
 package engine
 
 import (
-	"fmt"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/AviK0928/RedisGo/internal/resp"
 )
 
-// Version is reported by the stats endpoint and, later, by INFO.
-const Version = "0.1.0"
+const Version = "0.2.0"
 
-// Config holds every tunable.
 type Config struct {
 	MaxMemoryMB       int
 	MaxKeysPerSession int
@@ -22,7 +21,6 @@ type Config struct {
 	HTTPAddr          string
 }
 
-// DefaultConfig is what you get when nothing is set.
 func DefaultConfig() Config {
 	return Config{
 		MaxMemoryMB:       32,
@@ -32,7 +30,6 @@ func DefaultConfig() Config {
 	}
 }
 
-// ConfigFromEnv layers environment variables on top of the defaults.
 func ConfigFromEnv() Config {
 	c := DefaultConfig()
 	if v, ok := envInt("MAX_MEMORY_MB"); ok {
@@ -59,7 +56,6 @@ func envInt(key string) (int, bool) {
 	return n, true
 }
 
-// Stats is the payload behind /api/stats.
 type Stats struct {
 	Version           string `json:"version"`
 	UptimeSeconds     int64  `json:"uptime_seconds"`
@@ -69,21 +65,39 @@ type Stats struct {
 	MaxMemoryMB       int    `json:"max_memory_mb"`
 }
 
-// Reply is a command result. Phase 1 replaces this with a full RESP value.
-type Reply struct {
-	Text  string
-	IsErr bool
+// Handler runs one command. Every handler returns a RESP value, including for
+// errors, because an error is a first-class reply type in the protocol.
+type Handler func(e *Engine, args []string) resp.Value
+
+// Command carries the metadata the dispatcher needs. Arity follows Redis's
+// convention: positive means exactly that many arguments including the command
+// name, negative means at least that many. Flags will matter in later phases,
+// when eviction and replication need to know which commands write.
+type Command struct {
+	Name    string
+	Arity   int
+	Flags   []string
+	Handler Handler
 }
 
-func okReply(text string) Reply {
-	return Reply{Text: text}
+var registry = map[string]Command{}
+
+func register(c Command) {
+	registry[strings.ToLower(c.Name)] = c
 }
 
-func errReply(text string) Reply {
-	return Reply{Text: text, IsErr: true}
+func init() {
+	register(Command{Name: "PING", Arity: -1, Handler: cmdPing})
+	register(Command{Name: "ECHO", Arity: 2, Handler: cmdEcho})
+	register(Command{Name: "SET", Arity: -3, Flags: []string{"write"}, Handler: cmdSet})
+	register(Command{Name: "GET", Arity: 2, Flags: []string{"readonly"}, Handler: cmdGet})
+	register(Command{Name: "DEL", Arity: -2, Flags: []string{"write"}, Handler: cmdDel})
+	register(Command{Name: "EXISTS", Arity: -2, Flags: []string{"readonly"}, Handler: cmdExists})
+	register(Command{Name: "DBSIZE", Arity: 1, Flags: []string{"readonly"}, Handler: cmdDBSize})
+	register(Command{Name: "FLUSHALL", Arity: -1, Flags: []string{"write"}, Handler: cmdFlushAll})
+	register(Command{Name: "COMMAND", Arity: -1, Handler: cmdCommand})
 }
 
-// Engine owns the keyspace and the server-wide counters.
 type Engine struct {
 	cfg       Config
 	startedAt time.Time
@@ -91,30 +105,42 @@ type Engine struct {
 	mu       sync.Mutex
 	commands uint64
 	conns    int
+
+	dataMu sync.RWMutex
+	data   map[string]string
 }
 
-// New builds an engine. It starts no listeners; that is the caller's job.
 func New(cfg Config) *Engine {
-	return &Engine{cfg: cfg, startedAt: time.Now()}
+	return &Engine{
+		cfg:       cfg,
+		startedAt: time.Now(),
+		data:      make(map[string]string),
+	}
 }
 
-// Config returns the configuration this engine was built with.
 func (e *Engine) Config() Config {
 	return e.cfg
 }
 
-// Stats snapshots the current counters.
 func (e *Engine) Stats() Stats {
 	e.mu.Lock()
-	defer e.mu.Unlock()
+	commands, conns := e.commands, e.conns
+	e.mu.Unlock()
+
 	return Stats{
 		Version:           Version,
 		UptimeSeconds:     int64(time.Since(e.startedAt).Seconds()),
-		Keys:              0, // the real keyspace arrives in phase 2
-		CommandsProcessed: e.commands,
-		Connections:       e.conns,
+		Keys:              e.keyCount(),
+		CommandsProcessed: commands,
+		Connections:       conns,
 		MaxMemoryMB:       e.cfg.MaxMemoryMB,
 	}
+}
+
+func (e *Engine) keyCount() int {
+	e.dataMu.RLock()
+	defer e.dataMu.RUnlock()
+	return len(e.data)
 }
 
 // AddConn adjusts the live connection count. Pass -1 on disconnect.
@@ -124,34 +150,116 @@ func (e *Engine) AddConn(delta int) {
 	e.mu.Unlock()
 }
 
-// Execute runs one command.
-//
-// PHASE 0 PLACEHOLDER. In phase 1 this becomes a dispatch table keyed on the
-// command name and returns a resp.Value. Keep the shape (args in, reply out)
-// so the TCP and HTTP callers do not have to change.
-func (e *Engine) Execute(args []string) Reply {
+// Execute looks up one command, checks its arity, and runs it.
+func (e *Engine) Execute(args []string) resp.Value {
 	if len(args) == 0 {
-		return errReply("ERR empty command")
+		return resp.Err("ERR empty command")
+	}
+
+	name := strings.ToLower(args[0])
+	cmd, found := registry[name]
+	if !found {
+		return resp.Errf("ERR unknown command '%s'", args[0])
+	}
+	if !arityOK(cmd.Arity, len(args)) {
+		return resp.Errf("ERR wrong number of arguments for '%s' command", name)
 	}
 
 	e.mu.Lock()
 	e.commands++
 	e.mu.Unlock()
 
-	switch strings.ToUpper(args[0]) {
-	case "PING":
-		if len(args) > 1 {
-			return okReply(strings.Join(args[1:], " "))
-		}
-		return okReply("PONG")
-	case "ECHO":
-		if len(args) != 2 {
-			return errReply("ERR wrong number of arguments for 'echo' command")
-		}
-		return okReply(args[1])
-	case "VERSION":
-		return okReply("redisgo " + Version)
-	default:
-		return errReply(fmt.Sprintf("ERR unknown command '%s' (implemented in a later phase)", args[0]))
+	return cmd.Handler(e, args)
+}
+
+func arityOK(arity, got int) bool {
+	if arity >= 0 {
+		return got == arity
 	}
+	return got >= -arity
+}
+
+func cmdPing(e *Engine, args []string) resp.Value {
+	if len(args) > 2 {
+		return resp.Err("ERR wrong number of arguments for 'ping' command")
+	}
+	if len(args) == 2 {
+		return resp.BulkString(args[1])
+	}
+	return resp.Simple("PONG")
+}
+
+func cmdEcho(e *Engine, args []string) resp.Value {
+	return resp.BulkString(args[1])
+}
+
+func cmdSet(e *Engine, args []string) resp.Value {
+	// Options like EX and NX arrive in phase 2, along with expiry.
+	if len(args) != 3 {
+		return resp.Err("ERR syntax error")
+	}
+
+	e.dataMu.Lock()
+	e.data[args[1]] = args[2]
+	e.dataMu.Unlock()
+
+	return resp.Simple("OK")
+}
+
+func cmdGet(e *Engine, args []string) resp.Value {
+	e.dataMu.RLock()
+	value, found := e.data[args[1]]
+	e.dataMu.RUnlock()
+
+	if !found {
+		return resp.NullBulk()
+	}
+	return resp.BulkString(value)
+}
+
+func cmdDel(e *Engine, args []string) resp.Value {
+	deleted := 0
+
+	e.dataMu.Lock()
+	for _, key := range args[1:] {
+		if _, found := e.data[key]; found {
+			delete(e.data, key)
+			deleted++
+		}
+	}
+	e.dataMu.Unlock()
+
+	return resp.Int(int64(deleted))
+}
+
+func cmdExists(e *Engine, args []string) resp.Value {
+	count := 0
+
+	e.dataMu.RLock()
+	for _, key := range args[1:] {
+		if _, found := e.data[key]; found {
+			count++
+		}
+	}
+	e.dataMu.RUnlock()
+
+	return resp.Int(int64(count))
+}
+
+func cmdDBSize(e *Engine, args []string) resp.Value {
+	return resp.Int(int64(e.keyCount()))
+}
+
+func cmdFlushAll(e *Engine, args []string) resp.Value {
+	e.dataMu.Lock()
+	e.data = make(map[string]string)
+	e.dataMu.Unlock()
+
+	return resp.Simple("OK")
+}
+
+// cmdCommand is a stub. redis-cli sends COMMAND DOCS on connect and waits for
+// a reply before showing a prompt, so without this the client appears to hang.
+func cmdCommand(e *Engine, args []string) resp.Value {
+	return resp.Arr()
 }

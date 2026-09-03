@@ -1,13 +1,7 @@
 // Package server is the TCP front door.
-//
-// PHASE 0: it reads inline commands (one space-separated line each) and writes
-// RESP simple strings and errors. Enough for nc and cmd/cli, but not for the
-// real redis-cli, which speaks RESP arrays. Phase 1 swaps the line reader for a
-// resp.Reader; the accept loop below stays as it is.
 package server
 
 import (
-	"bufio"
 	"context"
 	"log"
 	"net"
@@ -15,6 +9,7 @@ import (
 	"time"
 
 	"github.com/AviK0928/RedisGo/internal/engine"
+	"github.com/AviK0928/RedisGo/internal/resp"
 )
 
 const idleTimeout = 10 * time.Minute
@@ -52,8 +47,8 @@ func handleConn(e *engine.Engine, conn net.Conn) {
 	e.AddConn(1)
 	defer e.AddConn(-1)
 
-	reader := bufio.NewReader(conn)
-	writer := bufio.NewWriter(conn)
+	reader := resp.NewReader(conn)
+	writer := resp.NewWriter(conn)
 
 	for {
 		// drop connections that go quiet, so idle clients do not pile up
@@ -61,35 +56,23 @@ func handleConn(e *engine.Engine, conn net.Conn) {
 			return
 		}
 
-		line, err := reader.ReadString('\n')
+		args, err := reader.ReadCommand()
 		if err != nil {
-			return // client disconnected, or hit the deadline
+			return // client disconnected, malformed input, or idle timeout
 		}
-
-		args := strings.Fields(strings.TrimSpace(line))
 		if len(args) == 0 {
 			continue
 		}
+
+		// QUIT is handled here rather than in the engine, because it is the
+		// only command whose effect is on the connection itself.
 		if strings.EqualFold(args[0], "QUIT") {
-			writeReply(writer, engine.Reply{Text: "OK"})
-			writer.Flush()
+			writer.Write(resp.Simple("OK"))
 			return
 		}
 
-		writeReply(writer, e.Execute(args))
-		if err := writer.Flush(); err != nil {
+		if err := writer.Write(e.Execute(args)); err != nil {
 			return
 		}
 	}
-}
-
-// writeReply encodes a reply as a RESP simple string or simple error.
-func writeReply(w *bufio.Writer, r engine.Reply) {
-	if r.IsErr {
-		w.WriteString("-")
-	} else {
-		w.WriteString("+")
-	}
-	w.WriteString(r.Text)
-	w.WriteString("\r\n")
 }
