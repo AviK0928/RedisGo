@@ -71,8 +71,18 @@ func handleConn(e *engine.Engine, conn net.Conn) {
 			return
 		}
 
-		if err := writer.Write(e.Execute(args)); err != nil {
+		if err := writer.WriteNoFlush(e.Execute(args)); err != nil {
 			return
+		}
+
+		// Hold the reply in the buffer while more commands are already waiting
+		// to be parsed. A client that pipelined a batch then gets every reply
+		// in one write syscall instead of one syscall per command, which is
+		// most of what makes pipelining faster than sequential round trips.
+		if reader.Buffered() == 0 {
+			if err := writer.Flush(); err != nil {
+				return
+			}
 		}
 	}
 }

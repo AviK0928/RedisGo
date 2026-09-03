@@ -15,7 +15,7 @@ import (
 	"github.com/AviK0928/RedisGo/internal/resp"
 )
 
-const Version = "0.6.0"
+const Version = "0.7.0"
 
 const (
 	expiryInterval   = 100 * time.Millisecond
@@ -155,15 +155,25 @@ type Stats struct {
 
 type Handler func(e *Engine, args []string) resp.Value
 
-// Command carries the metadata the dispatcher needs. Arity follows Redis's
-// convention: positive means exactly that many arguments including the command
-// name, negative means at least that many. The write flag is what tells the
-// engine which commands must check memory first and reach the AOF afterwards.
+// Command carries the metadata the dispatcher needs.
+//
+// Arity follows Redis's convention: positive means exactly that many arguments
+// including the command name, negative means at least that many. The write
+// flag tells the engine which commands must check memory first and reach the
+// AOF afterwards.
+//
+// FirstKey, LastKey and KeyStep describe where the key arguments are, the same
+// way COMMAND INFO reports them. A generic dispatcher cannot know that GET's
+// key is at position 1 while MSET's keys are at 1, 3, 5 without being told,
+// and the browser playground needs exactly that to namespace keys per visitor.
 type Command struct {
-	Name    string
-	Arity   int
-	Flags   []string
-	Handler Handler
+	Name     string
+	Arity    int
+	Flags    []string
+	FirstKey int // 0 means the command takes no keys
+	LastKey  int // -1 means "through the last argument"
+	KeyStep  int
+	Handler  Handler
 }
 
 func (c Command) isWrite() bool {
@@ -175,10 +185,43 @@ func (c Command) isWrite() bool {
 	return false
 }
 
+// keyPositions lists the argument indexes holding keys, for a call of argc
+// arguments.
+func (c Command) keyPositions(argc int) []int {
+	if c.FirstKey <= 0 || c.FirstKey >= argc {
+		return nil
+	}
+
+	step := c.KeyStep
+	if step <= 0 {
+		step = 1
+	}
+
+	last := c.LastKey
+	if last < 0 {
+		last = argc + last // -1 becomes the final index
+	}
+	if last >= argc {
+		last = argc - 1
+	}
+
+	var positions []int
+	for i := c.FirstKey; i <= last; i += step {
+		positions = append(positions, i)
+	}
+	return positions
+}
+
 var registry = map[string]Command{}
 
 func register(c Command) {
 	registry[strings.ToLower(c.Name)] = c
+}
+
+// Lookup returns a registered command by name.
+func Lookup(name string) (Command, bool) {
+	cmd, found := registry[strings.ToLower(name)]
+	return cmd, found
 }
 
 func init() {
@@ -188,62 +231,66 @@ func init() {
 	register(Command{Name: "COMMAND", Arity: -1, Handler: cmdCommand})
 
 	// strings
-	register(Command{Name: "SET", Arity: -3, Flags: []string{"write"}, Handler: cmdSet})
-	register(Command{Name: "GET", Arity: 2, Flags: []string{"readonly"}, Handler: cmdGet})
-	register(Command{Name: "SETNX", Arity: 3, Flags: []string{"write"}, Handler: cmdSetNX})
-	register(Command{Name: "SETEX", Arity: 4, Flags: []string{"write"}, Handler: cmdSetEX})
-	register(Command{Name: "APPEND", Arity: 3, Flags: []string{"write"}, Handler: cmdAppend})
-	register(Command{Name: "STRLEN", Arity: 2, Flags: []string{"readonly"}, Handler: cmdStrlen})
-	register(Command{Name: "INCR", Arity: 2, Flags: []string{"write"}, Handler: cmdIncr})
-	register(Command{Name: "DECR", Arity: 2, Flags: []string{"write"}, Handler: cmdDecr})
-	register(Command{Name: "INCRBY", Arity: 3, Flags: []string{"write"}, Handler: cmdIncrBy})
-	register(Command{Name: "DECRBY", Arity: 3, Flags: []string{"write"}, Handler: cmdDecrBy})
-	register(Command{Name: "MGET", Arity: -2, Flags: []string{"readonly"}, Handler: cmdMGet})
-	register(Command{Name: "MSET", Arity: -3, Flags: []string{"write"}, Handler: cmdMSet})
+	register(Command{Name: "SET", Arity: -3, Flags: []string{"write"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdSet})
+	register(Command{Name: "GET", Arity: 2, Flags: []string{"readonly"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdGet})
+	register(Command{Name: "SETNX", Arity: 3, Flags: []string{"write"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdSetNX})
+	register(Command{Name: "SETEX", Arity: 4, Flags: []string{"write"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdSetEX})
+	register(Command{Name: "APPEND", Arity: 3, Flags: []string{"write"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdAppend})
+	register(Command{Name: "STRLEN", Arity: 2, Flags: []string{"readonly"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdStrlen})
+	register(Command{Name: "INCR", Arity: 2, Flags: []string{"write"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdIncr})
+	register(Command{Name: "DECR", Arity: 2, Flags: []string{"write"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdDecr})
+	register(Command{Name: "INCRBY", Arity: 3, Flags: []string{"write"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdIncrBy})
+	register(Command{Name: "DECRBY", Arity: 3, Flags: []string{"write"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdDecrBy})
+	register(Command{Name: "MGET", Arity: -2, Flags: []string{"readonly"}, FirstKey: 1, LastKey: -1, KeyStep: 1, Handler: cmdMGet})
 
-	// keyspace
-	register(Command{Name: "DEL", Arity: -2, Flags: []string{"write"}, Handler: cmdDel})
-	register(Command{Name: "EXISTS", Arity: -2, Flags: []string{"readonly"}, Handler: cmdExists})
-	register(Command{Name: "TYPE", Arity: 2, Flags: []string{"readonly"}, Handler: cmdType})
+	// MSET alternates key and value, hence the step of two.
+	register(Command{Name: "MSET", Arity: -3, Flags: []string{"write"}, FirstKey: 1, LastKey: -1, KeyStep: 2, Handler: cmdMSet})
+
+	// keyspace. KEYS, DBSIZE and FLUSHALL deliberately carry no key spec:
+	// they act on the whole keyspace, and a session answers them from its own
+	// view rather than by rewriting arguments.
+	register(Command{Name: "DEL", Arity: -2, Flags: []string{"write"}, FirstKey: 1, LastKey: -1, KeyStep: 1, Handler: cmdDel})
+	register(Command{Name: "EXISTS", Arity: -2, Flags: []string{"readonly"}, FirstKey: 1, LastKey: -1, KeyStep: 1, Handler: cmdExists})
+	register(Command{Name: "TYPE", Arity: 2, Flags: []string{"readonly"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdType})
 	register(Command{Name: "KEYS", Arity: 2, Flags: []string{"readonly"}, Handler: cmdKeys})
 	register(Command{Name: "DBSIZE", Arity: 1, Flags: []string{"readonly"}, Handler: cmdDBSize})
 	register(Command{Name: "FLUSHALL", Arity: -1, Flags: []string{"write"}, Handler: cmdFlushAll})
 
 	// expiry
-	register(Command{Name: "EXPIRE", Arity: 3, Flags: []string{"write"}, Handler: cmdExpire})
-	register(Command{Name: "PEXPIRE", Arity: 3, Flags: []string{"write"}, Handler: cmdPExpire})
-	register(Command{Name: "TTL", Arity: 2, Flags: []string{"readonly"}, Handler: cmdTTL})
-	register(Command{Name: "PTTL", Arity: 2, Flags: []string{"readonly"}, Handler: cmdPTTL})
-	register(Command{Name: "PERSIST", Arity: 2, Flags: []string{"write"}, Handler: cmdPersist})
+	register(Command{Name: "EXPIRE", Arity: 3, Flags: []string{"write"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdExpire})
+	register(Command{Name: "PEXPIRE", Arity: 3, Flags: []string{"write"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdPExpire})
+	register(Command{Name: "PEXPIREAT", Arity: 3, Flags: []string{"write"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdPExpireAt})
+	register(Command{Name: "TTL", Arity: 2, Flags: []string{"readonly"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdTTL})
+	register(Command{Name: "PTTL", Arity: 2, Flags: []string{"readonly"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdPTTL})
+	register(Command{Name: "PERSIST", Arity: 2, Flags: []string{"write"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdPersist})
 
 	// lists
-	register(Command{Name: "LPUSH", Arity: -3, Flags: []string{"write"}, Handler: cmdLPush})
-	register(Command{Name: "RPUSH", Arity: -3, Flags: []string{"write"}, Handler: cmdRPush})
-	register(Command{Name: "LPOP", Arity: 2, Flags: []string{"write"}, Handler: cmdLPop})
-	register(Command{Name: "RPOP", Arity: 2, Flags: []string{"write"}, Handler: cmdRPop})
-	register(Command{Name: "LLEN", Arity: 2, Flags: []string{"readonly"}, Handler: cmdLLen})
-	register(Command{Name: "LRANGE", Arity: 4, Flags: []string{"readonly"}, Handler: cmdLRange})
+	register(Command{Name: "LPUSH", Arity: -3, Flags: []string{"write"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdLPush})
+	register(Command{Name: "RPUSH", Arity: -3, Flags: []string{"write"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdRPush})
+	register(Command{Name: "LPOP", Arity: 2, Flags: []string{"write"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdLPop})
+	register(Command{Name: "RPOP", Arity: 2, Flags: []string{"write"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdRPop})
+	register(Command{Name: "LLEN", Arity: 2, Flags: []string{"readonly"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdLLen})
+	register(Command{Name: "LRANGE", Arity: 4, Flags: []string{"readonly"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdLRange})
 
 	// hashes
-	register(Command{Name: "HSET", Arity: -4, Flags: []string{"write"}, Handler: cmdHSet})
-	register(Command{Name: "HGET", Arity: 3, Flags: []string{"readonly"}, Handler: cmdHGet})
-	register(Command{Name: "HDEL", Arity: -3, Flags: []string{"write"}, Handler: cmdHDel})
-	register(Command{Name: "HLEN", Arity: 2, Flags: []string{"readonly"}, Handler: cmdHLen})
-	register(Command{Name: "HEXISTS", Arity: 3, Flags: []string{"readonly"}, Handler: cmdHExists})
-	register(Command{Name: "HGETALL", Arity: 2, Flags: []string{"readonly"}, Handler: cmdHGetAll})
+	register(Command{Name: "HSET", Arity: -4, Flags: []string{"write"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdHSet})
+	register(Command{Name: "HGET", Arity: 3, Flags: []string{"readonly"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdHGet})
+	register(Command{Name: "HDEL", Arity: -3, Flags: []string{"write"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdHDel})
+	register(Command{Name: "HLEN", Arity: 2, Flags: []string{"readonly"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdHLen})
+	register(Command{Name: "HEXISTS", Arity: 3, Flags: []string{"readonly"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdHExists})
+	register(Command{Name: "HGETALL", Arity: 2, Flags: []string{"readonly"}, FirstKey: 1, LastKey: 1, KeyStep: 1, Handler: cmdHGetAll})
 
 	// admin
 	register(Command{Name: "CONFIG", Arity: -3, Handler: cmdConfig})
 	register(Command{Name: "INFO", Arity: -1, Handler: cmdInfo})
-	register(Command{Name: "MEMORY", Arity: -2, Handler: cmdMemory})
-	register(Command{Name: "OBJECT", Arity: 3, Handler: cmdObject})
+	register(Command{Name: "MEMORY", Arity: -2, FirstKey: 2, LastKey: 2, KeyStep: 1, Handler: cmdMemory})
+	register(Command{Name: "OBJECT", Arity: 3, FirstKey: 2, LastKey: 2, KeyStep: 1, Handler: cmdObject})
 
 	// persistence
 	register(Command{Name: "SAVE", Arity: 1, Handler: cmdSave})
 	register(Command{Name: "BGSAVE", Arity: 1, Handler: cmdBGSave})
 	register(Command{Name: "BGREWRITEAOF", Arity: 1, Handler: cmdBGRewriteAOF})
 	register(Command{Name: "LASTSAVE", Arity: 1, Handler: cmdLastSave})
-	register(Command{Name: "PEXPIREAT", Arity: 3, Flags: []string{"write"}, Handler: cmdPExpireAt})
 }
 
 type Engine struct {
@@ -256,6 +303,10 @@ type Engine struct {
 	// after it succeeds, so a rejected command never reaches the log.
 	aofLog *aof.Log
 
+	// rewriteMu is held across an append and across the swap at the end of a
+	// rewrite, so no command can land on a log file that is being replaced.
+	rewriteMu sync.Mutex
+
 	// loading suppresses logging during replay: the commands being replayed
 	// came from the log, and re-appending them would double the file on every
 	// restart.
@@ -266,16 +317,17 @@ type Engine struct {
 	maxMemory atomic.Int64
 	policy    atomic.Uint32
 
-	mu              sync.Mutex
-	commands        uint64
-	conns           int
-	expired         uint64
-	evicted         uint64
-	rewriteMu       sync.Mutex
+	// Guards against two background saves or rewrites running at once.
 	saving          atomic.Bool
 	rewriting       atomic.Bool
 	rewriteBaseline atomic.Int64
-	lastSave        time.Time
+
+	mu       sync.Mutex
+	commands uint64
+	conns    int
+	expired  uint64
+	evicted  uint64
+	lastSave time.Time
 }
 
 func New(cfg Config) *Engine {
@@ -295,6 +347,7 @@ func NewWithClock(cfg Config, clock Clock) *Engine {
 	return e
 }
 
+// EnableAOF restores the keyspace from disk, then opens the log for appending.
 func (e *Engine) EnableAOF() error {
 	// The snapshot loads first because it is the older, coarser record: it
 	// holds everything up to the last dump, and the AOF then replays whatever
@@ -343,6 +396,7 @@ func (e *Engine) CloseAOF() error {
 func (e *Engine) Policy() Policy     { return Policy(e.policy.Load()) }
 func (e *Engine) SetPolicy(p Policy) { e.policy.Store(uint32(p)) }
 func (e *Engine) MaxMemory() int64   { return e.maxMemory.Load() }
+
 func (e *Engine) SetMaxMemory(n int64) {
 	if n < 0 {
 		n = 0
@@ -492,10 +546,6 @@ func (e *Engine) Execute(args []string) resp.Value {
 	// The log is written after the fact, and only on success. A command that
 	// hit a WRONGTYPE or was refused for memory must not be in the log, or
 	// replay would rebuild a state the server never actually had.
-	//
-	// The rewrite lock is held across the append so a command cannot land on
-	// the old file in the window where a rewrite is closing it and renaming
-	// the replacement into place.
 	if cmd.isWrite() && e.aofLog != nil && !e.loading.Load() && reply.Type != resp.Error {
 		e.rewriteMu.Lock()
 		if err := e.aofLog.Append(args); err != nil {

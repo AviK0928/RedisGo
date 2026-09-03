@@ -57,6 +57,12 @@ func Arr(items ...Value) Value  { return Value{Type: Array, Array: items} }
 func Errf(format string, a ...any) Value { return Err(fmt.Sprintf(format, a...)) }
 
 // Writer serializes values onto a connection.
+//
+// Encoding and flushing are separate operations because that separation is
+// what makes pipelining worthwhile. A caller sending one value uses Write and
+// gets a flush for free; a caller sending a batch uses WriteNoFlush repeatedly
+// and flushes once, paying a single syscall for the whole batch rather than
+// one per value.
 type Writer struct {
 	w *bufio.Writer
 }
@@ -66,11 +72,22 @@ func NewWriter(w io.Writer) *Writer {
 }
 
 // Write encodes one value and flushes it. Nothing reaches the socket until the
-// flush, so forgetting it leaves the client waiting forever.
+// flush, so a caller that forgets to flush leaves the other side waiting.
 func (w *Writer) Write(v Value) error {
 	if err := w.encode(v); err != nil {
 		return err
 	}
+	return w.w.Flush()
+}
+
+// WriteNoFlush encodes a value into the buffer and leaves it there. Use it for
+// a batch, then call Flush once at the end.
+func (w *Writer) WriteNoFlush(v Value) error {
+	return w.encode(v)
+}
+
+// Flush pushes whatever is buffered to the underlying writer.
+func (w *Writer) Flush() error {
 	return w.w.Flush()
 }
 
@@ -129,6 +146,13 @@ type Reader struct {
 
 func NewReader(r io.Reader) *Reader {
 	return &Reader{r: bufio.NewReader(r)}
+}
+
+// Buffered reports how many bytes are already read from the connection and
+// waiting to be parsed. A server uses it to decide whether more commands are
+// pending, so it can hold its replies in the buffer and flush them together.
+func (r *Reader) Buffered() int {
+	return r.r.Buffered()
 }
 
 // ReadCommand reads one command as a flat argument list.
