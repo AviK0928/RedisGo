@@ -125,7 +125,12 @@ The cache engine, protocol, storage, eviction and persistence are standard
 library only. Two dependencies sit at the edges: `gorilla/websocket` for the
 browser handshake, and `go-redis` in tests, where it proves wire compatibility
 by driving the server as an ordinary Redis client would.
- 
+
+## Screenshot
+
+![Entry](screenshot/01-entry.png)
+![Basic](screenshot/02-basic.png)
+
 ## Deployment
  
 One binary. The static files are compiled in with `go:embed`, so there is no
