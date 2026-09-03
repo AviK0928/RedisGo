@@ -1,0 +1,13 @@
+# build output
+/server
+/RedisGo
+*.exe
+
+# persistence files (phase 5)
+*.aof
+*.rdb
+
+# local
+.env
+.DS_Store
+*.test

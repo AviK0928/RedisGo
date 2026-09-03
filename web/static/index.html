@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>redisgo</title>
+<style>
+  body {
+    margin: 0; padding: 3rem 1.5rem;
+    background: #e9edeb; color: #131b18;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    line-height: 1.6;
+  }
+  main { max-width: 60ch; margin: 0 auto; }
+  h1 { font-size: 2rem; margin: 0 0 .25rem; }
+  p.sub { color: #5d6b65; margin: 0 0 2rem; }
+  #status { padding-bottom: .75rem; border-bottom: 1px solid #c3cdc8; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: .35rem 1.5rem; margin: 1.5rem 0; }
+  dt { color: #5d6b65; }
+  dd { margin: 0; font-variant-numeric: tabular-nums; }
+  footer { color: #5d6b65; font-size: .85rem; border-top: 1px solid #c3cdc8; padding-top: 1rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>redisgo</h1>
+  <p class="sub">An in-memory cache server that speaks Redis, written in Go.</p>
+
+  <div id="status">connecting to the server</div>
+
+  <dl>
+    <dt>version</dt><dd id="version">&mdash;</dd>
+    <dt>uptime</dt><dd id="uptime">&mdash;</dd>
+    <dt>commands</dt><dd id="commands">&mdash;</dd>
+    <dt>connections</dt><dd id="connections">&mdash;</dd>
+    <dt>memory cap</dt><dd id="maxmem">&mdash;</dd>
+  </dl>
+
+  <footer>Phase 0 of 9. The terminal lands in a later phase.</footer>
+</main>
+
+<script>
+  const el = (id) => document.getElementById(id);
+
+  function uptime(s) {
+    const m = Math.floor(s / 60), sec = s % 60;
+    return m > 0 ? m + "m " + String(sec).padStart(2, "0") + "s" : sec + "s";
+  }
+
+  async function poll() {
+    try {
+      const res = await fetch("/api/stats", { cache: "no-store" });
+      if (!res.ok) throw new Error(res.status);
+      const s = await res.json();
+      el("status").textContent = "server awake, accepting commands";
+      el("version").textContent = s.version;
+      el("uptime").textContent = uptime(s.uptime_seconds);
+      el("commands").textContent = s.commands_processed;
+      el("connections").textContent = s.connections;
+      el("maxmem").textContent = s.max_memory_mb + " MB";
+    } catch {
+      el("status").textContent = "no answer from the server, retrying";
+    }
+  }
+
+  poll();
+  setInterval(poll, 2000);
+</script>
+</body>
+</html>

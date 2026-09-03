@@ -1,0 +1,6 @@
+{
+	  "name": "redisgo",
+	    "image": "mcr.microsoft.com/devcontainers/go:1.22",
+	      "postCreateCommand": "sudo apt-get update && sudo apt-get install -y redis-tools",
+	        "forwardPorts": [6379, 8080]
+}
