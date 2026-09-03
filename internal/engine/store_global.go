@@ -198,3 +198,28 @@ func (s *GlobalStore) ExpireCycle(sampleSize int, threshold float64) int {
 	}
 	return removed
 }
+
+func (s *GlobalStore) Snapshot(fn func(string, *Entry)) {
+	now := s.clock.Now()
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for key, entry := range s.data {
+		if !entry.expired(now) {
+			fn(key, entry)
+		}
+	}
+}
+
+func (s *GlobalStore) Restore(key string, entry *Entry) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if existing, found := s.data[key]; found {
+		s.bytes -= existing.size(key)
+	}
+	entry.touch(s.clock.Now())
+	s.data[key] = entry
+	s.bytes += entry.size(key)
+}

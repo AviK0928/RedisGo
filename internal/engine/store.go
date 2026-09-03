@@ -36,4 +36,11 @@ type Store interface {
 	// Sample returns up to n randomly chosen keys for the eviction policy to
 	// judge. volatileOnly restricts it to keys that have a TTL.
 	Sample(n int, volatileOnly bool) []Candidate
+	// Snapshot calls fn for every live entry. The callback runs under a read
+	// lock, so it must not call back into the store.
+	Snapshot(fn func(key string, entry *Entry))
+
+	// Restore inserts an entry directly, bypassing command dispatch. Used
+	// only when loading a snapshot.
+	Restore(key string, entry *Entry)
 }

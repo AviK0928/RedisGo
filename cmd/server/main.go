@@ -30,13 +30,21 @@ func main() {
 	cfg := engine.ConfigFromEnv()
 	eng := engine.New(cfg)
 
+	// Recovery happens before anything can connect: the snapshot restores the
+	// keyspace as of the last dump, then the AOF replays whatever followed.
+	if err := eng.EnableAOF(); err != nil {
+		log.Fatalf("recovery: %v", err)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Active expiration. Without this the server only notices an expired key
-	// when someone reads it, so keys nobody touches again would leak.
-	expiryDone := make(chan struct{})
-	go eng.StartExpiryLoop(expiryDone)
+	// Active expiration, without which the server only notices an expired key
+	// when someone reads it, so keys nobody touches again would leak. The
+	// persistence loop compacts the AOF once it has outgrown its last rewrite.
+	background := make(chan struct{})
+	go eng.StartExpiryLoop(background)
+	go eng.StartPersistenceLoop(background)
 
 	httpAddr := cfg.HTTPAddr
 	cloud := false
@@ -74,12 +82,29 @@ func main() {
 
 	// Render sends SIGTERM and allows 30 seconds before killing the process.
 	log.Println("shutdown signal received, draining connections")
-	close(expiryDone)
 
-	drain, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	// Stop background work first, so a rewrite cannot be in flight while the
+	// log is being closed.
+	close(background)
+
+	// Drain before persisting. Requests still in flight are writes that have
+	// to reach the log, so closing it first would drop them.
+	drain, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(drain); err != nil {
-		log.Printf("shutdown: %v", err)
+		log.Printf("http shutdown: %v", err)
 	}
+
+	// A final snapshot, so the next start does not replay the whole log.
+	if count, err := eng.Save(); err != nil {
+		log.Printf("shutdown save: %v", err)
+	} else {
+		log.Printf("saved %d keys", count)
+	}
+
+	if err := eng.CloseAOF(); err != nil {
+		log.Printf("aof close: %v", err)
+	}
+
 	log.Println("stopped")
 }

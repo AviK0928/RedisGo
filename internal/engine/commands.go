@@ -669,3 +669,63 @@ func cmdObject(e *Engine, args []string) resp.Value {
 		return resp.Errf("ERR unknown OBJECT subcommand '%s'", args[1])
 	}
 }
+
+// --- persistence ---
+
+func cmdSave(e *Engine, args []string) resp.Value {
+	count, err := e.Save()
+	if err != nil {
+		return resp.Errf("ERR %v", err)
+	}
+	_ = count
+	return resp.Simple("OK")
+}
+
+func cmdBGSave(e *Engine, args []string) resp.Value {
+	if !e.BGSave() {
+		return resp.Err("ERR background save already in progress")
+	}
+	return resp.Simple("Background saving started")
+}
+
+func cmdBGRewriteAOF(e *Engine, args []string) resp.Value {
+	if e.aofLog == nil {
+		return resp.Err("ERR AOF is not enabled")
+	}
+	if !e.BGRewriteAOF() {
+		return resp.Err("ERR background rewrite already in progress")
+	}
+	return resp.Simple("Background append only file rewriting started")
+}
+
+func cmdLastSave(e *Engine, args []string) resp.Value {
+	return resp.Int(e.Stats().LastSaveUnix)
+}
+
+// cmdPExpireAt sets an absolute expiry in milliseconds since the epoch. The
+// AOF rewrite emits this rather than EXPIRE, so a TTL survives a restart
+// without its clock being reset.
+func cmdPExpireAt(e *Engine, args []string) resp.Value {
+	millis, err := strconv.ParseInt(args[2], 10, 64)
+	if err != nil {
+		return resp.Err("ERR value is not an integer or out of range")
+	}
+
+	deadline := time.UnixMilli(millis)
+
+	var reply resp.Value
+	e.store.Update(args[1], func(current *Entry) *Entry {
+		if current == nil {
+			reply = resp.Int(0)
+			return nil
+		}
+		if !deadline.After(e.clock.Now()) {
+			reply = resp.Int(1)
+			return nil
+		}
+		current.ExpireAt = deadline
+		reply = resp.Int(1)
+		return current
+	})
+	return reply
+}

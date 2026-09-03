@@ -108,3 +108,13 @@ func (s *ShardedStore) ExpireCycle(sampleSize int, threshold float64) int {
 	}
 	return removed
 }
+
+func (s *ShardedStore) Snapshot(fn func(string, *Entry)) {
+	for _, shard := range s.shards {
+		shard.Snapshot(fn)
+	}
+}
+
+func (s *ShardedStore) Restore(key string, entry *Entry) {
+	s.shard(key).Restore(key, entry)
+}

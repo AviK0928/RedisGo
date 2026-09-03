@@ -183,3 +183,27 @@ func (s *SyncMapStore) ExpireCycle(sampleSize int, threshold float64) int {
 	}
 	return removed
 }
+
+func (s *SyncMapStore) Snapshot(fn func(string, *Entry)) {
+	now := s.clock.Now()
+
+	s.data.Range(func(key, value any) bool {
+		entry := value.(*Entry)
+		if !entry.expired(now) {
+			fn(key.(string), entry)
+		}
+		return true
+	})
+}
+
+func (s *SyncMapStore) Restore(key string, entry *Entry) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	if existing, found := s.data.Load(key); found {
+		s.bytes.Add(-existing.(*Entry).size(key))
+	}
+	entry.touch(s.clock.Now())
+	s.data.Store(key, entry)
+	s.bytes.Add(entry.size(key))
+}

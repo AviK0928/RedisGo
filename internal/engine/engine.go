@@ -3,6 +3,7 @@
 package engine
 
 import (
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -10,10 +11,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/AviK0928/RedisGo/internal/aof"
 	"github.com/AviK0928/RedisGo/internal/resp"
 )
 
-const Version = "0.5.0"
+const Version = "0.6.0"
 
 const (
 	expiryInterval   = 100 * time.Millisecond
@@ -48,6 +50,10 @@ type Config struct {
 	Store             StoreKind
 	ShardCount        int
 	Policy            Policy
+	AOFEnabled        bool
+	AOFPath           string
+	AOFSync           aof.SyncPolicy
+	SnapshotPath      string
 }
 
 func DefaultConfig() Config {
@@ -59,6 +65,10 @@ func DefaultConfig() Config {
 		Store:             StoreSharded,
 		ShardCount:        256,
 		Policy:            AllKeysLRU,
+		AOFEnabled:        false,
+		AOFPath:           "redisgo.aof",
+		AOFSync:           aof.SyncEverySec,
+		SnapshotPath:      "redisgo.rdb",
 	}
 }
 
@@ -86,6 +96,18 @@ func ConfigFromEnv() Config {
 	}
 	if p, ok := ParsePolicy(os.Getenv("MAXMEMORY_POLICY")); ok {
 		c.Policy = p
+	}
+	if os.Getenv("AOF_ENABLED") == "true" {
+		c.AOFEnabled = true
+	}
+	if v := os.Getenv("AOF_PATH"); v != "" {
+		c.AOFPath = v
+	}
+	if p, ok := aof.ParseSyncPolicy(os.Getenv("AOF_SYNC")); ok {
+		c.AOFSync = p
+	}
+	if v := os.Getenv("SNAPSHOT_PATH"); v != "" {
+		c.SnapshotPath = v
 	}
 	return c
 }
@@ -126,6 +148,9 @@ type Stats struct {
 	MemoryPercent     float64 `json:"memory_percent"`
 	Policy            string  `json:"policy"`
 	StoreKind         string  `json:"store_kind"`
+	AOFEnabled        bool    `json:"aof_enabled"`
+	AOFSizeBytes      int64   `json:"aof_size_bytes"`
+	LastSaveUnix      int64   `json:"last_save_unix"`
 }
 
 type Handler func(e *Engine, args []string) resp.Value
@@ -133,7 +158,7 @@ type Handler func(e *Engine, args []string) resp.Value
 // Command carries the metadata the dispatcher needs. Arity follows Redis's
 // convention: positive means exactly that many arguments including the command
 // name, negative means at least that many. The write flag is what tells the
-// engine which commands must check memory before running.
+// engine which commands must check memory first and reach the AOF afterwards.
 type Command struct {
 	Name    string
 	Arity   int
@@ -212,6 +237,13 @@ func init() {
 	register(Command{Name: "INFO", Arity: -1, Handler: cmdInfo})
 	register(Command{Name: "MEMORY", Arity: -2, Handler: cmdMemory})
 	register(Command{Name: "OBJECT", Arity: 3, Handler: cmdObject})
+
+	// persistence
+	register(Command{Name: "SAVE", Arity: 1, Handler: cmdSave})
+	register(Command{Name: "BGSAVE", Arity: 1, Handler: cmdBGSave})
+	register(Command{Name: "BGREWRITEAOF", Arity: 1, Handler: cmdBGRewriteAOF})
+	register(Command{Name: "LASTSAVE", Arity: 1, Handler: cmdLastSave})
+	register(Command{Name: "PEXPIREAT", Arity: 3, Flags: []string{"write"}, Handler: cmdPExpireAt})
 }
 
 type Engine struct {
@@ -220,16 +252,30 @@ type Engine struct {
 	store     Store
 	startedAt time.Time
 
+	// aofLog is nil when persistence is off. Every write command is appended
+	// after it succeeds, so a rejected command never reaches the log.
+	aofLog *aof.Log
+
+	// loading suppresses logging during replay: the commands being replayed
+	// came from the log, and re-appending them would double the file on every
+	// restart.
+	loading atomic.Bool
+
 	// Reconfigurable at runtime through CONFIG SET, and read on every write,
 	// so they are atomics rather than mutex-guarded fields.
 	maxMemory atomic.Int64
 	policy    atomic.Uint32
 
-	mu       sync.Mutex
-	commands uint64
-	conns    int
-	expired  uint64
-	evicted  uint64
+	mu              sync.Mutex
+	commands        uint64
+	conns           int
+	expired         uint64
+	evicted         uint64
+	rewriteMu       sync.Mutex
+	saving          atomic.Bool
+	rewriting       atomic.Bool
+	rewriteBaseline atomic.Int64
+	lastSave        time.Time
 }
 
 func New(cfg Config) *Engine {
@@ -247,6 +293,51 @@ func NewWithClock(cfg Config, clock Clock) *Engine {
 	e.maxMemory.Store(int64(cfg.MaxMemoryMB) * 1024 * 1024)
 	e.policy.Store(uint32(cfg.Policy))
 	return e
+}
+
+func (e *Engine) EnableAOF() error {
+	// The snapshot loads first because it is the older, coarser record: it
+	// holds everything up to the last dump, and the AOF then replays whatever
+	// happened after. Loading them the other way round would let stale
+	// snapshot values overwrite newer logged ones.
+	if _, err := e.LoadSnapshot(); err != nil {
+		return err
+	}
+
+	if !e.cfg.AOFEnabled {
+		return nil
+	}
+
+	start := e.clock.Now()
+
+	e.loading.Store(true)
+	applied, err := aof.Replay(e.cfg.AOFPath, func(args []string) {
+		e.Execute(args)
+	})
+	e.loading.Store(false)
+
+	if err != nil {
+		return err
+	}
+	if applied > 0 {
+		log.Printf("aof: replayed %d commands in %v, %d keys restored",
+			applied, e.clock.Now().Sub(start), e.store.Len())
+	}
+
+	logFile, err := aof.Open(e.cfg.AOFPath, e.cfg.AOFSync)
+	if err != nil {
+		return err
+	}
+	e.aofLog = logFile
+	return nil
+}
+
+// CloseAOF flushes and closes the log. Safe to call when AOF is off.
+func (e *Engine) CloseAOF() error {
+	if e.aofLog == nil {
+		return nil
+	}
+	return e.aofLog.Close()
 }
 
 func (e *Engine) Policy() Policy     { return Policy(e.policy.Load()) }
@@ -329,6 +420,7 @@ func (e *Engine) Config() Config { return e.cfg }
 func (e *Engine) Stats() Stats {
 	e.mu.Lock()
 	commands, conns, expired, evicted := e.commands, e.conns, e.expired, e.evicted
+	lastSave := e.lastSave
 	e.mu.Unlock()
 
 	used := e.store.MemoryUsed()
@@ -337,6 +429,11 @@ func (e *Engine) Stats() Stats {
 	percent := 0.0
 	if limit > 0 {
 		percent = float64(used) / float64(limit) * 100
+	}
+
+	var aofSize int64
+	if e.aofLog != nil {
+		aofSize = e.aofLog.Size()
 	}
 
 	return Stats{
@@ -352,6 +449,9 @@ func (e *Engine) Stats() Stats {
 		MemoryPercent:     percent,
 		Policy:            e.Policy().String(),
 		StoreKind:         string(e.cfg.Store),
+		AOFEnabled:        e.aofLog != nil,
+		AOFSizeBytes:      aofSize,
+		LastSaveUnix:      lastSave.Unix(),
 	}
 }
 
@@ -387,7 +487,24 @@ func (e *Engine) Execute(args []string) resp.Value {
 	e.commands++
 	e.mu.Unlock()
 
-	return cmd.Handler(e, args)
+	reply := cmd.Handler(e, args)
+
+	// The log is written after the fact, and only on success. A command that
+	// hit a WRONGTYPE or was refused for memory must not be in the log, or
+	// replay would rebuild a state the server never actually had.
+	//
+	// The rewrite lock is held across the append so a command cannot land on
+	// the old file in the window where a rewrite is closing it and renaming
+	// the replacement into place.
+	if cmd.isWrite() && e.aofLog != nil && !e.loading.Load() && reply.Type != resp.Error {
+		e.rewriteMu.Lock()
+		if err := e.aofLog.Append(args); err != nil {
+			log.Printf("aof: append failed: %v", err)
+		}
+		e.rewriteMu.Unlock()
+	}
+
+	return reply
 }
 
 func arityOK(arity, got int) bool {
