@@ -12,7 +12,15 @@ import (
 	"github.com/AviK0928/RedisGo/internal/resp"
 )
 
-const Version = "0.2.0"
+const Version = "0.3.0"
+
+// How often the active expiry loop runs, and how it samples. These match
+// Redis's defaults closely enough that the behaviour is comparable.
+const (
+	expiryInterval   = 100 * time.Millisecond
+	expirySampleSize = 20
+	expiryThreshold  = 0.25
+)
 
 type Config struct {
 	MaxMemoryMB       int
@@ -62,17 +70,15 @@ type Stats struct {
 	Keys              int    `json:"keys"`
 	CommandsProcessed uint64 `json:"commands_processed"`
 	Connections       int    `json:"connections"`
+	ExpiredKeys       uint64 `json:"expired_keys"`
 	MaxMemoryMB       int    `json:"max_memory_mb"`
 }
 
-// Handler runs one command. Every handler returns a RESP value, including for
-// errors, because an error is a first-class reply type in the protocol.
 type Handler func(e *Engine, args []string) resp.Value
 
 // Command carries the metadata the dispatcher needs. Arity follows Redis's
 // convention: positive means exactly that many arguments including the command
-// name, negative means at least that many. Flags will matter in later phases,
-// when eviction and replication need to know which commands write.
+// name, negative means at least that many.
 type Command struct {
 	Name    string
 	Arity   int
@@ -87,70 +93,140 @@ func register(c Command) {
 }
 
 func init() {
+	// connection
 	register(Command{Name: "PING", Arity: -1, Handler: cmdPing})
 	register(Command{Name: "ECHO", Arity: 2, Handler: cmdEcho})
+	register(Command{Name: "COMMAND", Arity: -1, Handler: cmdCommand})
+
+	// strings
 	register(Command{Name: "SET", Arity: -3, Flags: []string{"write"}, Handler: cmdSet})
 	register(Command{Name: "GET", Arity: 2, Flags: []string{"readonly"}, Handler: cmdGet})
+	register(Command{Name: "SETNX", Arity: 3, Flags: []string{"write"}, Handler: cmdSetNX})
+	register(Command{Name: "SETEX", Arity: 4, Flags: []string{"write"}, Handler: cmdSetEX})
+	register(Command{Name: "APPEND", Arity: 3, Flags: []string{"write"}, Handler: cmdAppend})
+	register(Command{Name: "STRLEN", Arity: 2, Flags: []string{"readonly"}, Handler: cmdStrlen})
+	register(Command{Name: "INCR", Arity: 2, Flags: []string{"write"}, Handler: cmdIncr})
+	register(Command{Name: "DECR", Arity: 2, Flags: []string{"write"}, Handler: cmdDecr})
+	register(Command{Name: "INCRBY", Arity: 3, Flags: []string{"write"}, Handler: cmdIncrBy})
+	register(Command{Name: "DECRBY", Arity: 3, Flags: []string{"write"}, Handler: cmdDecrBy})
+	register(Command{Name: "MGET", Arity: -2, Flags: []string{"readonly"}, Handler: cmdMGet})
+	register(Command{Name: "MSET", Arity: -3, Flags: []string{"write"}, Handler: cmdMSet})
+
+	// keyspace
 	register(Command{Name: "DEL", Arity: -2, Flags: []string{"write"}, Handler: cmdDel})
 	register(Command{Name: "EXISTS", Arity: -2, Flags: []string{"readonly"}, Handler: cmdExists})
+	register(Command{Name: "TYPE", Arity: 2, Flags: []string{"readonly"}, Handler: cmdType})
+	register(Command{Name: "KEYS", Arity: 2, Flags: []string{"readonly"}, Handler: cmdKeys})
 	register(Command{Name: "DBSIZE", Arity: 1, Flags: []string{"readonly"}, Handler: cmdDBSize})
 	register(Command{Name: "FLUSHALL", Arity: -1, Flags: []string{"write"}, Handler: cmdFlushAll})
-	register(Command{Name: "COMMAND", Arity: -1, Handler: cmdCommand})
+
+	// expiry
+	register(Command{Name: "EXPIRE", Arity: 3, Flags: []string{"write"}, Handler: cmdExpire})
+	register(Command{Name: "PEXPIRE", Arity: 3, Flags: []string{"write"}, Handler: cmdPExpire})
+	register(Command{Name: "TTL", Arity: 2, Flags: []string{"readonly"}, Handler: cmdTTL})
+	register(Command{Name: "PTTL", Arity: 2, Flags: []string{"readonly"}, Handler: cmdPTTL})
+	register(Command{Name: "PERSIST", Arity: 2, Flags: []string{"write"}, Handler: cmdPersist})
+
+	// lists
+	register(Command{Name: "LPUSH", Arity: -3, Flags: []string{"write"}, Handler: cmdLPush})
+	register(Command{Name: "RPUSH", Arity: -3, Flags: []string{"write"}, Handler: cmdRPush})
+	register(Command{Name: "LPOP", Arity: 2, Flags: []string{"write"}, Handler: cmdLPop})
+	register(Command{Name: "RPOP", Arity: 2, Flags: []string{"write"}, Handler: cmdRPop})
+	register(Command{Name: "LLEN", Arity: 2, Flags: []string{"readonly"}, Handler: cmdLLen})
+	register(Command{Name: "LRANGE", Arity: 4, Flags: []string{"readonly"}, Handler: cmdLRange})
+
+	// hashes
+	register(Command{Name: "HSET", Arity: -4, Flags: []string{"write"}, Handler: cmdHSet})
+	register(Command{Name: "HGET", Arity: 3, Flags: []string{"readonly"}, Handler: cmdHGet})
+	register(Command{Name: "HDEL", Arity: -3, Flags: []string{"write"}, Handler: cmdHDel})
+	register(Command{Name: "HLEN", Arity: 2, Flags: []string{"readonly"}, Handler: cmdHLen})
+	register(Command{Name: "HEXISTS", Arity: 3, Flags: []string{"readonly"}, Handler: cmdHExists})
+	register(Command{Name: "HGETALL", Arity: 2, Flags: []string{"readonly"}, Handler: cmdHGetAll})
 }
 
 type Engine struct {
 	cfg       Config
+	clock     Clock
+	store     *Store
 	startedAt time.Time
 
 	mu       sync.Mutex
 	commands uint64
 	conns    int
-
-	dataMu sync.RWMutex
-	data   map[string]string
+	expired  uint64
 }
 
 func New(cfg Config) *Engine {
+	return NewWithClock(cfg, realClock{})
+}
+
+// NewWithClock builds an engine on an injected clock, for tests.
+func NewWithClock(cfg Config, clock Clock) *Engine {
 	return &Engine{
 		cfg:       cfg,
-		startedAt: time.Now(),
-		data:      make(map[string]string),
+		clock:     clock,
+		store:     NewStore(clock),
+		startedAt: clock.Now(),
 	}
 }
 
-func (e *Engine) Config() Config {
-	return e.cfg
+// StartExpiryLoop runs active expiration until the channel closes. Without it
+// the server only notices expired keys when someone reads them.
+func (e *Engine) StartExpiryLoop(done <-chan struct{}) {
+	ticker := time.NewTicker(expiryInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			removed := e.store.activeExpiryCycle(expirySampleSize, expiryThreshold)
+			if removed > 0 {
+				e.mu.Lock()
+				e.expired += uint64(removed)
+				e.mu.Unlock()
+			}
+		}
+	}
 }
+
+// ExpireNow runs one expiry cycle immediately. Tests use it to avoid waiting
+// for the ticker.
+func (e *Engine) ExpireNow() int {
+	removed := e.store.activeExpiryCycle(expirySampleSize, expiryThreshold)
+	if removed > 0 {
+		e.mu.Lock()
+		e.expired += uint64(removed)
+		e.mu.Unlock()
+	}
+	return removed
+}
+
+func (e *Engine) Config() Config { return e.cfg }
 
 func (e *Engine) Stats() Stats {
 	e.mu.Lock()
-	commands, conns := e.commands, e.conns
+	commands, conns, expired := e.commands, e.conns, e.expired
 	e.mu.Unlock()
 
 	return Stats{
 		Version:           Version,
-		UptimeSeconds:     int64(time.Since(e.startedAt).Seconds()),
-		Keys:              e.keyCount(),
+		UptimeSeconds:     int64(e.clock.Now().Sub(e.startedAt).Seconds()),
+		Keys:              e.store.Len(),
 		CommandsProcessed: commands,
 		Connections:       conns,
+		ExpiredKeys:       expired,
 		MaxMemoryMB:       e.cfg.MaxMemoryMB,
 	}
 }
 
-func (e *Engine) keyCount() int {
-	e.dataMu.RLock()
-	defer e.dataMu.RUnlock()
-	return len(e.data)
-}
-
-// AddConn adjusts the live connection count. Pass -1 on disconnect.
 func (e *Engine) AddConn(delta int) {
 	e.mu.Lock()
 	e.conns += delta
 	e.mu.Unlock()
 }
 
-// Execute looks up one command, checks its arity, and runs it.
 func (e *Engine) Execute(args []string) resp.Value {
 	if len(args) == 0 {
 		return resp.Err("ERR empty command")
@@ -179,87 +255,20 @@ func arityOK(arity, got int) bool {
 	return got >= -arity
 }
 
-func cmdPing(e *Engine, args []string) resp.Value {
-	if len(args) > 2 {
-		return resp.Err("ERR wrong number of arguments for 'ping' command")
-	}
-	if len(args) == 2 {
-		return resp.BulkString(args[1])
-	}
-	return resp.Simple("PONG")
+// wrongType is the error real Redis returns when a command meets a key of the
+// wrong kind. Clients check for this prefix, so the wording matters.
+func wrongType() resp.Value {
+	return resp.Err("WRONGTYPE Operation against a key holding the wrong kind of value")
 }
 
-func cmdEcho(e *Engine, args []string) resp.Value {
-	return resp.BulkString(args[1])
-}
-
-func cmdSet(e *Engine, args []string) resp.Value {
-	// Options like EX and NX arrive in phase 2, along with expiry.
-	if len(args) != 3 {
-		return resp.Err("ERR syntax error")
-	}
-
-	e.dataMu.Lock()
-	e.data[args[1]] = args[2]
-	e.dataMu.Unlock()
-
-	return resp.Simple("OK")
-}
-
-func cmdGet(e *Engine, args []string) resp.Value {
-	e.dataMu.RLock()
-	value, found := e.data[args[1]]
-	e.dataMu.RUnlock()
-
+// fetch returns a live entry of the expected kind.
+func (e *Engine) fetch(key string, want Kind) (*Entry, bool, bool) {
+	entry, found := e.store.Get(key)
 	if !found {
-		return resp.NullBulk()
+		return nil, false, true
 	}
-	return resp.BulkString(value)
-}
-
-func cmdDel(e *Engine, args []string) resp.Value {
-	deleted := 0
-
-	e.dataMu.Lock()
-	for _, key := range args[1:] {
-		if _, found := e.data[key]; found {
-			delete(e.data, key)
-			deleted++
-		}
+	if entry.Kind != want {
+		return nil, false, false
 	}
-	e.dataMu.Unlock()
-
-	return resp.Int(int64(deleted))
-}
-
-func cmdExists(e *Engine, args []string) resp.Value {
-	count := 0
-
-	e.dataMu.RLock()
-	for _, key := range args[1:] {
-		if _, found := e.data[key]; found {
-			count++
-		}
-	}
-	e.dataMu.RUnlock()
-
-	return resp.Int(int64(count))
-}
-
-func cmdDBSize(e *Engine, args []string) resp.Value {
-	return resp.Int(int64(e.keyCount()))
-}
-
-func cmdFlushAll(e *Engine, args []string) resp.Value {
-	e.dataMu.Lock()
-	e.data = make(map[string]string)
-	e.dataMu.Unlock()
-
-	return resp.Simple("OK")
-}
-
-// cmdCommand is a stub. redis-cli sends COMMAND DOCS on connect and waits for
-// a reply before showing a prompt, so without this the client appears to hang.
-func cmdCommand(e *Engine, args []string) resp.Value {
-	return resp.Arr()
+	return entry, true, true
 }

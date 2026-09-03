@@ -33,6 +33,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Active expiration. Without this the server only notices an expired key
+	// when someone reads it, so keys nobody touches again would leak.
+	expiryDone := make(chan struct{})
+	go eng.StartExpiryLoop(expiryDone)
+
 	httpAddr := cfg.HTTPAddr
 	cloud := false
 	if port := os.Getenv("PORT"); port != "" {
@@ -69,6 +74,8 @@ func main() {
 
 	// Render sends SIGTERM and allows 30 seconds before killing the process.
 	log.Println("shutdown signal received, draining connections")
+	close(expiryDone)
+
 	drain, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(drain); err != nil {
