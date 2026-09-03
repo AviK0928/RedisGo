@@ -9,7 +9,7 @@ with the standard library.
 
 > Status: phase 0 of 9. The build, test, and deploy pipeline works end to end.
 > The cache itself is being built on top of it, one subsystem at a time.
-> Progress below.
+> Progress is tracked below.
 
 ## Why
 
@@ -24,7 +24,7 @@ No third-party dependencies so far. Everything is the Go standard library.
 
 Requires Go 1.22 or later.
 
-```bash
+```
 go run ./cmd/server
 ```
 
@@ -37,7 +37,7 @@ Two listeners start:
 
 Drive it with the bundled client, in a second terminal:
 
-```bash
+```
 go run ./cmd/cli
 127.0.0.1:6379> PING
 PONG
@@ -49,7 +49,7 @@ Once phase 1 lands, `redis-cli -p 6379` connects here too.
 
 ## Tests
 
-```bash
+```
 go test ./...          # fast
 go test -race ./...    # what CI runs
 go vet ./...
@@ -57,3 +57,42 @@ gofmt -l .             # should print nothing
 ```
 
 ## Architecture
+
+```
+cmd/server       the binary, and the local/cloud mode switch
+cmd/cli          a small client, so redis-tools is not needed to develop
+internal/engine  the cache core: config, counters, command execution
+internal/server  the TCP front door
+web              the HTTP front door and the embedded stats page
+```
+
+The engine knows nothing about transports. The TCP listener and the HTTP
+handler both call the same `Execute`, which is what will let a browser terminal
+and a real Redis client exercise identical code.
+
+## Progress
+
+- [x] Scaffold, CI, and continuous deployment
+- [ ] RESP protocol, so redis-cli can connect
+- [ ] Data structures and key expiry
+- [ ] Sharded concurrent store, benchmarked against a single-mutex baseline
+- [ ] Memory limits and eviction (LRU, LFU, TTL)
+- [ ] Append-only file and snapshots
+- [ ] Pub/sub, transactions, pipelining
+- [ ] Leader-follower replication
+- [ ] Terminal in the browser
+
+## Deployment
+
+One binary, deployed to a Render free web service using Render's native Go
+runtime. No Dockerfile and no separate frontend build: the static files are
+compiled into the binary with `go:embed`.
+
+When `PORT` is set the server assumes it is in the cloud and starts only the
+HTTP listener, because a free web service exposes exactly one port. The free
+instance sleeps after 15 minutes without traffic, so the first request after an
+idle period takes about a minute to answer.
+
+## License
+
+MIT
